@@ -1,0 +1,648 @@
+"""
+Computer Vision Techniques Cheatsheet
+From basic image processing to advanced deep learning architectures
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import transforms, models
+import cv2
+import numpy as np
+from PIL import Image
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# ============================================================================
+# IMAGE PREPROCESSING & AUGMENTATION
+# ============================================================================
+
+# Basic transformations with torchvision
+basic_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Advanced augmentations with Albumentations
+advanced_transforms = A.Compose([
+    A.Resize(224, 224),
+    A.HorizontalFlip(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=30, p=0.5),
+    A.RandomBrightnessContrast(p=0.5),
+    A.GaussNoise(p=0.3),
+    A.Blur(blur_limit=3, p=0.3),
+    A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.3),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+# Test-time augmentation (TTA)
+def tta_predict(model, image, num_augments=5):
+    """Test-time augmentation for better predictions"""
+    predictions = []
+    for _ in range(num_augments):
+        aug_image = advanced_transforms(image=image)['image']
+        with torch.no_grad():
+            pred = model(aug_image.unsqueeze(0))
+        predictions.append(pred)
+    return torch.mean(torch.stack(predictions), dim=0)
+
+# ============================================================================
+# CNN ARCHITECTURES
+# ============================================================================
+
+# Basic CNN
+class BasicCNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super(BasicCNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(128 * 28 * 28, 512)
+        self.fc2 = nn.Linear(512, num_classes)
+        self.dropout = nn.Dropout(0.5)
+        
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = x.view(x.size(0), -1)
+        x = self.dropout(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+        return x
+
+# ResNet Block
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+# Attention mechanism
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SelfAttention, self).__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, 1)
+        self.value = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        B, C, H, W = x.size()
+        query = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
+        key = self.key(x).view(B, -1, H * W)
+        attention = F.softmax(torch.bmm(query, key), dim=-1)
+        value = self.value(x).view(B, -1, H * W)
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(B, C, H, W)
+        return self.gamma * out + x
+
+# Vision Transformer (ViT) components
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+        super(PatchEmbedding, self).__init__()
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, stride=patch_size)
+        
+    def forward(self, x):
+        x = self.proj(x)  # (B, embed_dim, H', W')
+        x = x.flatten(2).transpose(1, 2)  # (B, n_patches, embed_dim)
+        return x
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+        super(TransformerBlock, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+# ============================================================================
+# TRANSFER LEARNING
+# ============================================================================
+
+def get_pretrained_model(model_name='resnet50', num_classes=10, freeze_backbone=True):
+    """Get pretrained model with custom classifier"""
+    if model_name == 'resnet50':
+        model = models.resnet50(pretrained=True)
+        if freeze_backbone:
+            for param in model.parameters():
+                param.requires_grad = False
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        
+    elif model_name == 'efficientnet_b0':
+        model = models.efficientnet_b0(pretrained=True)
+        if freeze_backbone:
+            for param in model.parameters():
+                param.requires_grad = False
+        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+        
+    elif model_name == 'vit_b_16':
+        model = models.vit_b_16(pretrained=True)
+        if freeze_backbone:
+            for param in model.parameters():
+                param.requires_grad = False
+        model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
+        
+    return model
+
+# Fine-tuning with gradual unfreezing
+def unfreeze_model_gradually(model, current_epoch, total_epochs):
+    """Gradually unfreeze layers during training"""
+    if current_epoch > total_epochs * 0.3:
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+    if current_epoch > total_epochs * 0.6:
+        for param in model.layer3.parameters():
+            param.requires_grad = True
+
+# ============================================================================
+# OBJECT DETECTION
+# ============================================================================
+
+# Simple object detection with pretrained models
+def detect_objects(image_path, confidence_threshold=0.5):
+    """Detect objects using Faster R-CNN"""
+    model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+    model.eval()
+    
+    image = Image.open(image_path).convert('RGB')
+    transform = transforms.ToTensor()
+    image_tensor = transform(image).unsqueeze(0)
+    
+    with torch.no_grad():
+        predictions = model(image_tensor)
+    
+    boxes = predictions[0]['boxes'][predictions[0]['scores'] > confidence_threshold]
+    labels = predictions[0]['labels'][predictions[0]['scores'] > confidence_threshold]
+    scores = predictions[0]['scores'][predictions[0]['scores'] > confidence_threshold]
+    
+    return boxes, labels, scores
+
+# YOLO-style detection head
+class YOLOHead(nn.Module):
+    def __init__(self, in_channels, num_classes, num_anchors=3):
+        super(YOLOHead, self).__init__()
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        # 5 = (x, y, w, h, confidence)
+        self.conv = nn.Conv2d(in_channels, num_anchors * (5 + num_classes), 1)
+    
+    def forward(self, x):
+        return self.conv(x)
+
+# Non-Maximum Suppression
+def nms(boxes, scores, iou_threshold=0.5):
+    """Non-Maximum Suppression"""
+    indices = torchvision.ops.nms(boxes, scores, iou_threshold)
+    return indices
+
+# ============================================================================
+# SEMANTIC SEGMENTATION
+# ============================================================================
+
+# U-Net architecture
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1):
+        super(UNet, self).__init__()
+        
+        # Encoder
+        self.enc1 = self.conv_block(in_channels, 64)
+        self.enc2 = self.conv_block(64, 128)
+        self.enc3 = self.conv_block(128, 256)
+        self.enc4 = self.conv_block(256, 512)
+        
+        # Bottleneck
+        self.bottleneck = self.conv_block(512, 1024)
+        
+        # Decoder
+        self.upconv4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec4 = self.conv_block(1024, 512)
+        self.upconv3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec3 = self.conv_block(512, 256)
+        self.upconv2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = self.conv_block(256, 128)
+        self.upconv1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = self.conv_block(128, 64)
+        
+        self.out = nn.Conv2d(64, num_classes, 1)
+        self.pool = nn.MaxPool2d(2)
+        
+    def conv_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        # Encoder
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool(enc1))
+        enc3 = self.enc3(self.pool(enc2))
+        enc4 = self.enc4(self.pool(enc3))
+        
+        # Bottleneck
+        bottleneck = self.bottleneck(self.pool(enc4))
+        
+        # Decoder
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat([dec4, enc4], dim=1)
+        dec4 = self.dec4(dec4)
+        
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat([dec3, enc3], dim=1)
+        dec3 = self.dec3(dec3)
+        
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat([dec2, enc2], dim=1)
+        dec2 = self.dec2(dec2)
+        
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat([dec1, enc1], dim=1)
+        dec1 = self.dec1(dec1)
+        
+        return self.out(dec1)
+
+# DeepLab with ASPP (Atrous Spatial Pyramid Pooling)
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ASPP, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6)
+        self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12)
+        self.conv4 = nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv5 = nn.Conv2d(in_channels, out_channels, 1)
+        self.project = nn.Conv2d(out_channels * 5, out_channels, 1)
+        
+    def forward(self, x):
+        size = x.shape[2:]
+        feat1 = self.conv1(x)
+        feat2 = self.conv2(x)
+        feat3 = self.conv3(x)
+        feat4 = self.conv4(x)
+        feat5 = F.interpolate(self.conv5(self.pool(x)), size=size, mode='bilinear', align_corners=False)
+        out = torch.cat([feat1, feat2, feat3, feat4, feat5], dim=1)
+        return self.project(out)
+
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
+
+# Focal Loss for imbalanced datasets
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+# Dice Loss for segmentation
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+        
+    def forward(self, predictions, targets):
+        predictions = torch.sigmoid(predictions)
+        predictions = predictions.view(-1)
+        targets = targets.view(-1)
+        intersection = (predictions * targets).sum()
+        dice = (2. * intersection + self.smooth) / (predictions.sum() + targets.sum() + self.smooth)
+        return 1 - dice
+
+# IoU Loss
+class IoULoss(nn.Module):
+    def __init__(self):
+        super(IoULoss, self).__init__()
+        
+    def forward(self, predictions, targets):
+        predictions = torch.sigmoid(predictions)
+        intersection = (predictions * targets).sum()
+        union = predictions.sum() + targets.sum() - intersection
+        iou = intersection / (union + 1e-8)
+        return 1 - iou
+
+# ============================================================================
+# FEATURE EXTRACTION & EMBEDDINGS
+# ============================================================================
+
+def extract_features(model, dataloader, device='cuda'):
+    """Extract feature embeddings from a model"""
+    model.eval()
+    features = []
+    labels = []
+    
+    with torch.no_grad():
+        for images, targets in dataloader:
+            images = images.to(device)
+            # Remove classification head
+            feat = model.conv1(images)
+            feat = model.bn1(feat)
+            feat = model.relu(feat)
+            feat = model.maxpool(feat)
+            feat = model.layer1(feat)
+            feat = model.layer2(feat)
+            feat = model.layer3(feat)
+            feat = model.layer4(feat)
+            feat = model.avgpool(feat)
+            feat = torch.flatten(feat, 1)
+            
+            features.append(feat.cpu())
+            labels.append(targets.cpu())
+    
+    return torch.cat(features), torch.cat(labels)
+
+# Siamese Network for similarity learning
+class SiameseNetwork(nn.Module):
+    def __init__(self, embedding_dim=128):
+        super(SiameseNetwork, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 64, 10),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 7),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 4),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 6 * 6, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, embedding_dim)
+        )
+    
+    def forward_one(self, x):
+        x = self.cnn(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+    
+    def forward(self, x1, x2):
+        out1 = self.forward_one(x1)
+        out2 = self.forward_one(x2)
+        return out1, out2
+
+# Contrastive Loss
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=2.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+        
+    def forward(self, output1, output2, label):
+        euclidean_distance = F.pairwise_distance(output1, output2)
+        loss = torch.mean((1 - label) * torch.pow(euclidean_distance, 2) +
+                         label * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
+        return loss
+
+# ============================================================================
+# IMAGE GENERATION (GAN)
+# ============================================================================
+
+class Generator(nn.Module):
+    def __init__(self, latent_dim=100, img_channels=3):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(latent_dim, 512, 4, 1, 0),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, img_channels, 4, 2, 1),
+            nn.Tanh()
+        )
+    
+    def forward(self, z):
+        return self.model(z)
+
+class Discriminator(nn.Module):
+    def __init__(self, img_channels=3):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(img_channels, 64, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, 4, 2, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, 4, 1, 0),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, img):
+        return self.model(img)
+
+# ============================================================================
+# TRAINING UTILITIES
+# ============================================================================
+
+def train_classification_model(model, train_loader, val_loader, criterion, optimizer, 
+                                num_epochs=10, device='cuda', scheduler=None):
+    """Standard training loop for classification"""
+    model = model.to(device)
+    best_acc = 0.0
+    
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(labels).sum().item()
+        
+        # Validation
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(labels).sum().item()
+                val_total += labels.size(0)
+        
+        val_acc = 100. * val_correct / val_total
+        train_acc = 100. * train_correct / len(train_loader.dataset)
+        
+        print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss/len(train_loader):.4f}, '
+              f'Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
+        
+        if scheduler:
+            scheduler.step()
+        
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), 'best_model.pth')
+    
+    return model
+
+# Mixed precision training
+from torch.cuda.amp import autocast, GradScaler
+
+def train_with_mixed_precision(model, train_loader, criterion, optimizer, device='cuda'):
+    """Training with automatic mixed precision"""
+    scaler = GradScaler()
+    model.train()
+    
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        
+        with autocast():
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+# Gradient accumulation
+def train_with_gradient_accumulation(model, train_loader, criterion, optimizer, 
+                                     accumulation_steps=4, device='cuda'):
+    """Training with gradient accumulation for large batch sizes"""
+    model.train()
+    optimizer.zero_grad()
+    
+    for i, (images, labels) in enumerate(train_loader):
+        images, labels = images.to(device), labels.to(device)
+        
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss = loss / accumulation_steps
+        loss.backward()
+        
+        if (i + 1) % accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+# ============================================================================
+# EVALUATION METRICS
+# ============================================================================
+
+def calculate_metrics(predictions, targets, num_classes):
+    """Calculate precision, recall, F1 for multi-class"""
+    from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+    
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        targets, predictions, average='weighted'
+    )
+    cm = confusion_matrix(targets, predictions)
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': cm
+    }
+
+def calculate_iou(pred_mask, true_mask):
+    """Calculate Intersection over Union for segmentation"""
+    intersection = np.logical_and(pred_mask, true_mask).sum()
+    union = np.logical_or(pred_mask, true_mask).sum()
+    return intersection / (union + 1e-8)
+
+# ============================================================================
+# GRAD-CAM for visualization
+# ============================================================================
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        target_layer.register_forward_hook(self.save_activation)
+        target_layer.register_backward_hook(self.save_gradient)
+    
+    def save_activation(self, module, input, output):
+        self.activations = output.detach()
+    
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
+    
+    def generate_cam(self, input_image, target_class):
+        output = self.model(input_image)
+        self.model.zero_grad()
+        
+        class_loss = output[0, target_class]
+        class_loss.backward()
+        
+        gradients = self.gradients[0]
+        activations = self.activations[0]
+        
+        weights = gradients.mean(dim=(1, 2), keepdim=True)
+        cam = (weights * activations).sum(dim=0)
+        cam = F.relu(cam)
+        cam = cam / cam.max()
+        
+        return cam.cpu().numpy()
