@@ -1302,3 +1302,214 @@ if __name__ == "__main__":
     
     # Save model
     # torch.save(model.state_dict(), 'autoencoder.pth')
+from diffusers import DiffusionPipeline
+import torch
+
+pipe = DiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16
+).to("cuda")
+image = pipe("a futuristic robot on mars").images[0]
+image.save("out.png")
+from PIL import Image
+
+init = Image.open("input.png")
+
+image = pipe.img2img(
+    prompt="convert to watercolor style",
+    image=init,
+    strength=0.7
+).images[0]
+from diffusers import StableDiffusionInpaintPipeline
+import torch
+
+pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    "runwayml/stable-diffusion-inpainting-1.5",
+    torch_dtype=torch.float16
+).to("cuda")
+
+image = pipe(
+    prompt="replace with a steel robot",
+    image=init_image,
+    mask_image=mask,
+).images[0]
+pipe = DiffusionPipeline.from_pretrained("stabilityai/sd-x2-latent-upscaler")
+image = pipe(prompt="upscale", image=lowres).images[0]
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from diffusers import (
+    StableDiffusionPipeline,
+    DDPMScheduler,
+)
+from peft import LoraConfig, get_peft_model
+from PIL import Image
+from accelerate import Accelerator
+import os
+import json
+import random
+
+# ============================================================
+# 1. CONFIG
+# ============================================================
+MODEL_NAME = "runwayml/stable-diffusion-v1-5"
+OUTPUT_DIR = "./lora-output"
+DATA_PATH = "./dataset"  # folder of images + captions.json
+
+LR = 1e-4
+BATCH_SIZE = 1
+EPOCHS = 1
+RANK = 8
+IMAGE_SIZE = 512
+
+# ============================================================
+# 2. DATASET
+# ============================================================
+
+class Text2ImageDataset(Dataset):
+    def __init__(self, image_folder, captions_file, size=512):
+        self.size = size
+        self.image_folder = image_folder
+        with open(captions_file, "r") as f:
+            self.prompts = json.load(f)   # {"IMG_1.png": "prompt text", ...}
+        self.keys = list(self.prompts.keys())
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        fname = self.keys[idx]
+        prompt = self.prompts[fname]
+
+        img = Image.open(os.path.join(self.image_folder, fname)).convert("RGB")
+        img = img.resize((self.size, self.size))
+        img = torch.from_numpy((torch.tensor(img).permute(2, 0, 1) / 255.).numpy()).float()
+
+        return {
+            "pixel_values": img,
+            "prompt": prompt
+        }
+
+# ============================================================
+# 3. LOAD PIPELINE
+# ============================================================
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16
+)
+
+vae = pipe.vae
+tokenizer = pipe.tokenizer
+text_encoder = pipe.text_encoder
+unet = pipe.unet
+noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+
+# ============================================================
+# 4. INJECT LORA INTO UNET
+# ============================================================
+
+lora_config = LoraConfig(
+    r=RANK,
+    lora_alpha=16,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0"],  # SD-attn layers
+    lora_dropout=0.05,
+    bias="none",
+    task_type="UNET_CAUSAL_LM"
+)
+
+unet = get_peft_model(unet, lora_config)
+unet.print_trainable_parameters()
+
+# ============================================================
+# 5. DATA LOADER
+# ============================================================
+
+dataset = Text2ImageDataset(DATA_PATH, os.path.join(DATA_PATH, "captions.json"))
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# ============================================================
+# 6. ACCELERATOR
+# ============================================================
+
+accelerator = Accelerator(
+    mixed_precision="fp16",
+    gradient_accumulation_steps=1
+)
+
+unet, text_encoder, optimizer, dataloader = accelerator.prepare(
+    unet,
+    text_encoder,
+    torch.optim.AdamW(unet.parameters(), lr=LR),
+    dataloader
+)
+
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+pipe.unet = unet  # register updated UNet
+
+# ============================================================
+# 7. TRAINING LOOP
+# ============================================================
+
+global_step = 0
+for epoch in range(EPOCHS):
+    for batch in dataloader:
+
+        # ---- Encode prompt ----
+        text = tokenizer(
+            batch["prompt"],
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        text_input_ids = text.input_ids.to(accelerator.device)
+        encoder_hidden_states = text_encoder(text_input_ids)[0]
+
+        # ---- Encode image to latents ----
+        imgs = batch["pixel_values"].to(torch.float16).to(accelerator.device)
+        imgs = imgs.unsqueeze(0) if imgs.ndim == 3 else imgs
+        latents = vae.encode(imgs).latent_dist.sample() * 0.18215
+
+        # ---- Add noise ----
+        bsz = latents.shape[0]
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                                  (bsz,), device=accelerator.device).long()
+
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # ---- Predict noise via UNet ----
+        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        loss = F.mse_loss(model_pred, noise)
+
+        accelerator.backward(loss)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        global_step += 1
+
+        if accelerator.is_main_process and global_step % 20 == 0:
+            print(f"Step {global_step} | Loss: {loss.item():.4f}")
+
+# ============================================================
+# 8. SAVE LORA WEIGHTS
+# ============================================================
+
+if accelerator.is_main_process:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    unet.save_pretrained(os.path.join(OUTPUT_DIR, "lora-unet"))
+    print("LoRA saved to:", OUTPUT_DIR)
+
+# ============================================================
+# 9. LOAD FINETUNED LORA (FOR INFERENCE)
+# ============================================================
+"""
+from diffusers import StableDiffusionPipeline
+pipe = StableDiffusionPipeline.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to("cuda")
+pipe.unet.load_attn_procs("./lora-output/lora-unet")
+image = pipe("your prompt", num_inference_steps=25).images[0]
+image.save("result.png")
+"""
