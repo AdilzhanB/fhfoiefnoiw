@@ -487,6 +487,171 @@ class Discriminator(nn.Module):
     
     def forward(self, img):
         return self.model(img)
+# ============================================================================
+# 3. WEIGHT INITIALIZATION
+# ============================================================================
+
+def weights_init(m):
+    """Initialize weights according to DCGAN paper"""
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+
+# ============================================================================
+# 4. DATASET PREPARATION
+# ============================================================================
+
+def get_dataloader(data_path, img_size=64, batch_size=128):
+    """
+    Create dataloader for training
+    
+    Dataset structure:
+    data_path/
+        class1/
+            img1.jpg
+            img2.jpg
+        class2/
+            img1.jpg
+            img2.jpg
+    
+    Or for single class:
+    data_path/
+        img1.jpg
+        img2.jpg
+        img3.jpg
+    """
+    
+    transform = transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # [-1, 1]
+    ])
+    
+    dataset = datasets.ImageFolder(root=data_path, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
+    return dataloader
+class GANTrainer:
+    def __init__(self, generator, discriminator, device, lr=0.0002, beta1=0.5):
+        self.generator = generator.to(device)
+        self.discriminator = discriminator.to(device)
+        self.device = device
+        
+        # Initialize weights
+        self.generator.apply(weights_init)
+        self.discriminator.apply(weights_init)
+        
+        # Loss function
+        self.criterion = nn.BCELoss()
+        
+        # Optimizers (using Adam with specific betas from DCGAN paper)
+        self.optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(beta1, 0.999))
+        self.optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, 0.999))
+        
+        # For tracking
+        self.fixed_noise = torch.randn(64, 100, 1, 1, device=device)
+        self.losses_G = []
+        self.losses_D = []
+    
+    def train_step(self, real_imgs, latent_dim=100):
+        batch_size = real_imgs.size(0)
+        real_imgs = real_imgs.to(self.device)
+        
+        # Labels
+        real_label = torch.ones(batch_size, 1, device=self.device)
+        fake_label = torch.zeros(batch_size, 1, device=self.device)
+        
+        # ====================================
+        # Train Discriminator
+        # ====================================
+        self.optimizer_D.zero_grad()
+        
+        # Real images
+        output_real = self.discriminator(real_imgs)
+        loss_D_real = self.criterion(output_real, real_label)
+        
+        # Fake images
+        z = torch.randn(batch_size, latent_dim, 1, 1, device=self.device)
+        fake_imgs = self.generator(z)
+        output_fake = self.discriminator(fake_imgs.detach())
+        loss_D_fake = self.criterion(output_fake, fake_label)
+        
+        # Total discriminator loss
+        loss_D = loss_D_real + loss_D_fake
+        loss_D.backward()
+        self.optimizer_D.step()
+        
+        # ====================================
+        # Train Generator
+        # ====================================
+        self.optimizer_G.zero_grad()
+        
+        # Generate fake images and get discriminator opinion
+        output = self.discriminator(fake_imgs)
+        loss_G = self.criterion(output, real_label)  # Generator wants D to think these are real
+        
+        loss_G.backward()
+        self.optimizer_G.step()
+        
+        return loss_D.item(), loss_G.item()
+    
+    def train(self, dataloader, epochs=100, save_interval=10):
+        print(f"Starting training on {self.device}")
+        
+        for epoch in range(epochs):
+            epoch_loss_D = 0
+            epoch_loss_G = 0
+            
+            for i, (real_imgs, _) in enumerate(dataloader):
+                loss_D, loss_G = self.train_step(real_imgs)
+                epoch_loss_D += loss_D
+                epoch_loss_G += loss_G
+                
+                # Print progress
+                if i % 50 == 0:
+                    print(f"Epoch [{epoch+1}/{epochs}] Batch [{i}/{len(dataloader)}] "
+                          f"Loss_D: {loss_D:.4f} Loss_G: {loss_G:.4f}")
+            
+            # Average losses
+            avg_loss_D = epoch_loss_D / len(dataloader)
+            avg_loss_G = epoch_loss_G / len(dataloader)
+            self.losses_D.append(avg_loss_D)
+            self.losses_G.append(avg_loss_G)
+            
+            print(f"Epoch [{epoch+1}/{epochs}] Avg Loss_D: {avg_loss_D:.4f} Avg Loss_G: {avg_loss_G:.4f}")
+            
+            # Save generated samples
+            if (epoch + 1) % save_interval == 0:
+                self.save_samples(epoch + 1)
+    
+    def save_samples(self, epoch):
+        """Generate and save sample images"""
+        self.generator.eval()
+        with torch.no_grad():
+            fake_imgs = self.generator(self.fixed_noise)
+            fake_imgs = fake_imgs * 0.5 + 0.5  # Denormalize from [-1,1] to [0,1]
+            
+            # Save grid
+            os.makedirs('samples', exist_ok=True)
+            vutils.save_image(fake_imgs, f'samples/epoch_{epoch}.png', nrow=8, normalize=False)
+        self.generator.train()
+    
+    def plot_losses(self):
+        """Plot training losses"""
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.losses_D, label='Discriminator Loss')
+        plt.plot(self.losses_G, label='Generator Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('GAN Training Losses')
+        plt.savefig('training_losses.png')
+        plt.close()
 
 # ============================================================================
 # TRAINING UTILITIES
