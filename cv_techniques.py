@@ -1513,3 +1513,212 @@ pipe.unet.load_attn_procs("./lora-output/lora-unet")
 image = pipe("your prompt", num_inference_steps=25).images[0]
 image.save("result.png")
 """
+# ============================================================
+#               YOLO OBJECT DETECTION CHEATSHEET
+#      (Training, Inference, Validation, Custom Dataset)
+# ============================================================
+# This cheatsheet uses the ULTRALYTICS YOLOv8 API.
+# Covers:
+#   ✔ Training on custom dataset
+#   ✔ Dataset YAML format example
+#   ✔ Inference on images / videos / webcam
+#   ✔ Exporting to ONNX / TensorRT
+#   ✔ Tracking
+#   ✔ Validation / metrics
+#   ✔ Real-time streaming
+#   ✔ Use-case comments above each block
+# ============================================================
+
+# Install YOLO if needed:
+# pip install ultralytics
+
+from ultralytics import YOLO
+
+# ============================================================
+# 1. LOAD MODEL (pretrained or custom)
+# ============================================================
+# Use-case: load a pretrained detection model (YOLOv8n = fastest)
+model = YOLO("yolov8n.pt")  
+# model = YOLO("yolov8s.pt")  # more accurate
+# model = YOLO("runs/detect/train/weights/best.pt")  # load custom trained
+
+# ============================================================
+# 2. TRAIN ON CUSTOM DATASET
+# ============================================================
+# Use-case: train YOLO from scratch or finetune on your data.
+# Requirements: a dataset.yaml file pointing to train/val images.
+results = model.train(
+    data="dataset.yaml",   # <-- your YAML file
+    epochs=50,
+    imgsz=640,
+    batch=8,
+    lr0=0.001,
+    device=0,
+)
+
+
+# ============================================================
+# 3. DATASET YAML EXAMPLE (PUT IN dataset.yaml)
+# ============================================================
+# Use-case: define custom dataset structure.
+# Paste this YAML into dataset.yaml file:
+"""
+path: ./dataset                 # dataset root folder
+train: images/train
+val: images/val
+
+# number of classes
+nc: 3
+
+# class names
+names: ["person", "helmet", "smoke"]
+"""
+
+
+# ============================================================
+# 4. BASIC INFERENCE (IMAGE)
+# ============================================================
+# Use-case: detect objects in a single image
+results = model("test.jpg")
+results[0].show()              # display detections
+results[0].save("result.jpg")  # save result
+
+
+# ============================================================
+# 5. INFERENCE ON VIDEO
+# ============================================================
+# Use-case: detect objects on videos frame-by-frame
+model.predict(
+    source="test_video.mp4",
+    save=True,
+    conf=0.25,
+    device=0
+)
+
+
+# ============================================================
+# 6. REAL-TIME WEBCAM DETECTION
+# ============================================================
+# Use-case: live camera object detection (0 = default webcam)
+model.predict(
+    source=0,
+    show=True,
+    conf=0.35,
+    device=0
+)
+
+
+# ============================================================
+# 7. EXPORT MODEL (ONNX / TensorRT / CoreML)
+# ============================================================
+# Use-case: deploy YOLO model into mobile, cloud, embedded devices.
+model.export(format="onnx")      # ONNX for ML frameworks
+model.export(format="engine")    # NVIDIA TensorRT
+model.export(format="coreml")    # Apple devices
+model.export(format="tflite")    # Android/Edge
+model.export(format="openvino")  # Intel hardware
+
+
+# ============================================================
+# 8. TRACKING (BYTETrack, StrongSORT, etc.)
+# ============================================================
+# Use-case: track objects across multiple frames in video.
+model.track(
+    source="street.mp4",
+    save=True,
+    tracker="bytetrack.yaml",   # built-in tracker
+    conf=0.4
+)
+
+
+# ============================================================
+# 9. VALIDATION (mAP, Precision, Recall)
+# ============================================================
+# Use-case: evaluate the trained model on validation set.
+metrics = model.val(
+    data="dataset.yaml",
+    conf=0.25,
+)
+print(metrics)
+
+
+# ============================================================
+# 10. CUSTOM TRAINING TRICKS FOR IOAI
+# ============================================================
+# Use-case: apply advanced training options
+model.train(
+    data="dataset.yaml",
+    epochs=100,
+    imgsz=640,
+    batch=16,
+    lr0=5e-4,                # lower LR for finetuning
+    mosaic=0.7,              # augmentation
+    hsv_h=0.015,             # color augmentation
+    fliplr=0.5,              # left-right flip
+    mixup=0.2,
+    box=7.5, cls=2.0, dfl=1.5,  # loss weights
+    device=0
+)
+
+
+# ============================================================
+# 11. PYTHONIC LOW-LEVEL INFERENCE (get boxes programmatically)
+# ============================================================
+# Use-case: get bounding boxes, class IDs, scores inside code.
+results = model("image.jpg")[0]
+
+for box in results.boxes:
+    xyxy = box.xyxy[0].tolist()    # [x1, y1, x2, y2]
+    conf  = float(box.conf[0])     # confidence
+    cls   = int(box.cls[0])        # class index
+    print("Box:", xyxy, "Conf:", conf, "Class:", cls)
+
+
+# ============================================================
+# 12. SAVE RESULTS TO CSV / JSON
+# ============================================================
+# Use-case: export detections for competitions or analytics.
+import pandas as pd
+
+rows = []
+for box in results.boxes:
+    rows.append({
+        "x1": float(box.xyxy[0][0]),
+        "y1": float(box.xyxy[0][1]),
+        "x2": float(box.xyxy[0][2]),
+        "y2": float(box.xyxy[0][3]),
+        "conf": float(box.conf[0]),
+        "class": int(box.cls[0])
+    })
+
+pd.DataFrame(rows).to_csv("detections.csv", index=False)
+
+
+# ============================================================
+# 13. TRAIN FROM ZERO (NO PRETRAINED)
+# ============================================================
+# Use-case: fully custom-trained detector for specialized domain.
+model = YOLO("yolov8n.yaml")  # architecture only
+model.train(
+    data="dataset.yaml",
+    epochs=200,
+    imgsz=640,
+)
+
+
+# ============================================================
+# 14. CALLBACKS (CUSTOM LOGIC DURING TRAINING)
+# ============================================================
+# Use-case: save custom metrics, early stopping, etc.
+class MyCallback:
+    def on_fit_epoch_end(self, trainer):
+        print("Epoch:", trainer.epoch)
+
+model.add_callback("on_fit_epoch_end", MyCallback())
+
+
+# ============================================================
+# End of YOLO Object Detection Cheatsheet
+# Everything in one code block.
+# Copy-Paste & Run.
+# ============================================================
