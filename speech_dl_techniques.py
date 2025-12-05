@@ -831,3 +831,95 @@ def calculate_stoi(reference_audio, degraded_audio, sample_rate=16000):
     
     score = stoi(reference_audio, degraded_audio, sample_rate, extended=False)
     return score
+import torch
+import numpy as np
+from typing import Dict, List, Union
+
+class AudioEmbeddingExtractor:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def load_wav2vec(self, model_name="facebook/wav2vec2-base-960h"):
+        from transformers import Wav2Vec2Processor, Wav2Vec2Model
+        self.wav2vec_processor = Wav2Vec2Processor.from_pretrained(model_name)
+        self.wav2vec_model = Wav2Vec2Model.from_pretrained(model_name).to(self.device)
+        self.wav2vec_model.eval()
+    
+    def load_whisper(self, model_size="base"):
+        import whisper
+        self.whisper_model = whisper.load_model(model_size).to(self.device)
+    
+    def extract_all_embeddings(self, audio_path: str) -> Dict[str, torch.Tensor]:
+        """
+        Extract embeddings using both Wav2Vec and Whisper
+        """
+        import librosa
+        
+        results = {}
+        
+        # Load audio once
+        audio, sr = librosa.load(audio_path, sr=16000)
+        
+        # Wav2Vec embeddings
+        if hasattr(self, 'wav2vec_model'):
+            wav2vec_inputs = self.wav2vec_processor(audio, 
+                                                   sampling_rate=16000, 
+                                                   return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                wav2vec_outputs = self.wav2vec_model(**wav2vec_inputs)
+                results['wav2vec_sequence'] = wav2vec_outputs.last_hidden_state.cpu()
+                results['wav2vec_pooled'] = torch.mean(results['wav2vec_sequence'], dim=1)
+        
+        # Whisper embeddings
+        if hasattr(self, 'whisper_model'):
+            import whisper
+            audio_whisper = whisper.load_audio(audio_path)
+            audio_whisper = whisper.pad_or_trim(audio_whisper)
+            mel = whisper.log_mel_spectrogram(audio_whisper).to(self.device)
+            
+            with torch.no_grad():
+                if hasattr(self.whisper_model, 'encoder'):
+                    whisper_embeddings = self.whisper_model.encoder(mel.unsqueeze(0))
+                    results['whisper_embeddings'] = whisper_embeddings.cpu()
+        
+        return results
+    
+    def get_embedding_stats(self, embeddings: Dict[str, torch.Tensor]) -> Dict[str, Dict]:
+        """
+        Get statistics about the extracted embeddings
+        """
+        stats = {}
+        for name, emb in embeddings.items():
+            if isinstance(emb, torch.Tensor):
+                emb_np = emb.numpy()
+                stats[name] = {
+                    'shape': emb.shape,
+                    'mean': np.mean(emb_np),
+                    'std': np.std(emb_np),
+                    'min': np.min(emb_np),
+                    'max': np.max(emb_np)
+                }
+        return stats
+
+# Usage example
+def main():
+    extractor = AudioEmbeddingExtractor()
+    extractor.load_wav2vec()
+    extractor.load_whisper()
+    
+    audio_file = "your_audio.wav"
+    embeddings = extractor.extract_all_embeddings(audio_file)
+    
+    # Print results
+    for name, emb in embeddings.items():
+        print(f"{name}: {emb.shape}")
+    
+    # Get statistics
+    stats = extractor.get_embedding_stats(embeddings)
+    for name, stat in stats.items():
+        print(f"\n{name} statistics:")
+        for key, value in stat.items():
+            print(f"  {key}: {value}")
+
+if __name__ == "__main__":
+    main()

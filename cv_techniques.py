@@ -487,6 +487,171 @@ class Discriminator(nn.Module):
     
     def forward(self, img):
         return self.model(img)
+# ============================================================================
+# 3. WEIGHT INITIALIZATION
+# ============================================================================
+
+def weights_init(m):
+    """Initialize weights according to DCGAN paper"""
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+
+# ============================================================================
+# 4. DATASET PREPARATION
+# ============================================================================
+
+def get_dataloader(data_path, img_size=64, batch_size=128):
+    """
+    Create dataloader for training
+    
+    Dataset structure:
+    data_path/
+        class1/
+            img1.jpg
+            img2.jpg
+        class2/
+            img1.jpg
+            img2.jpg
+    
+    Or for single class:
+    data_path/
+        img1.jpg
+        img2.jpg
+        img3.jpg
+    """
+    
+    transform = transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # [-1, 1]
+    ])
+    
+    dataset = datasets.ImageFolder(root=data_path, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
+    return dataloader
+class GANTrainer:
+    def __init__(self, generator, discriminator, device, lr=0.0002, beta1=0.5):
+        self.generator = generator.to(device)
+        self.discriminator = discriminator.to(device)
+        self.device = device
+        
+        # Initialize weights
+        self.generator.apply(weights_init)
+        self.discriminator.apply(weights_init)
+        
+        # Loss function
+        self.criterion = nn.BCELoss()
+        
+        # Optimizers (using Adam with specific betas from DCGAN paper)
+        self.optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(beta1, 0.999))
+        self.optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, 0.999))
+        
+        # For tracking
+        self.fixed_noise = torch.randn(64, 100, 1, 1, device=device)
+        self.losses_G = []
+        self.losses_D = []
+    
+    def train_step(self, real_imgs, latent_dim=100):
+        batch_size = real_imgs.size(0)
+        real_imgs = real_imgs.to(self.device)
+        
+        # Labels
+        real_label = torch.ones(batch_size, 1, device=self.device)
+        fake_label = torch.zeros(batch_size, 1, device=self.device)
+        
+        # ====================================
+        # Train Discriminator
+        # ====================================
+        self.optimizer_D.zero_grad()
+        
+        # Real images
+        output_real = self.discriminator(real_imgs)
+        loss_D_real = self.criterion(output_real, real_label)
+        
+        # Fake images
+        z = torch.randn(batch_size, latent_dim, 1, 1, device=self.device)
+        fake_imgs = self.generator(z)
+        output_fake = self.discriminator(fake_imgs.detach())
+        loss_D_fake = self.criterion(output_fake, fake_label)
+        
+        # Total discriminator loss
+        loss_D = loss_D_real + loss_D_fake
+        loss_D.backward()
+        self.optimizer_D.step()
+        
+        # ====================================
+        # Train Generator
+        # ====================================
+        self.optimizer_G.zero_grad()
+        
+        # Generate fake images and get discriminator opinion
+        output = self.discriminator(fake_imgs)
+        loss_G = self.criterion(output, real_label)  # Generator wants D to think these are real
+        
+        loss_G.backward()
+        self.optimizer_G.step()
+        
+        return loss_D.item(), loss_G.item()
+    
+    def train(self, dataloader, epochs=100, save_interval=10):
+        print(f"Starting training on {self.device}")
+        
+        for epoch in range(epochs):
+            epoch_loss_D = 0
+            epoch_loss_G = 0
+            
+            for i, (real_imgs, _) in enumerate(dataloader):
+                loss_D, loss_G = self.train_step(real_imgs)
+                epoch_loss_D += loss_D
+                epoch_loss_G += loss_G
+                
+                # Print progress
+                if i % 50 == 0:
+                    print(f"Epoch [{epoch+1}/{epochs}] Batch [{i}/{len(dataloader)}] "
+                          f"Loss_D: {loss_D:.4f} Loss_G: {loss_G:.4f}")
+            
+            # Average losses
+            avg_loss_D = epoch_loss_D / len(dataloader)
+            avg_loss_G = epoch_loss_G / len(dataloader)
+            self.losses_D.append(avg_loss_D)
+            self.losses_G.append(avg_loss_G)
+            
+            print(f"Epoch [{epoch+1}/{epochs}] Avg Loss_D: {avg_loss_D:.4f} Avg Loss_G: {avg_loss_G:.4f}")
+            
+            # Save generated samples
+            if (epoch + 1) % save_interval == 0:
+                self.save_samples(epoch + 1)
+    
+    def save_samples(self, epoch):
+        """Generate and save sample images"""
+        self.generator.eval()
+        with torch.no_grad():
+            fake_imgs = self.generator(self.fixed_noise)
+            fake_imgs = fake_imgs * 0.5 + 0.5  # Denormalize from [-1,1] to [0,1]
+            
+            # Save grid
+            os.makedirs('samples', exist_ok=True)
+            vutils.save_image(fake_imgs, f'samples/epoch_{epoch}.png', nrow=8, normalize=False)
+        self.generator.train()
+    
+    def plot_losses(self):
+        """Plot training losses"""
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.losses_D, label='Discriminator Loss')
+        plt.plot(self.losses_G, label='Generator Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('GAN Training Losses')
+        plt.savefig('training_losses.png')
+        plt.close()
 
 # ============================================================================
 # TRAINING UTILITIES
@@ -646,3 +811,914 @@ class GradCAM:
         cam = cam / cam.max()
         
         return cam.cpu().numpy()
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, datasets
+import torchvision.utils as vutils
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+
+# ============================================================================
+# 1. VANILLA CONVOLUTIONAL AUTOENCODER
+# ============================================================================
+
+class ConvEncoder(nn.Module):
+    def __init__(self, img_channels=3, latent_dim=128):
+        super(ConvEncoder, self).__init__()
+        
+        # Input: 3 x 64 x 64
+        self.encoder = nn.Sequential(
+            # 3 x 64 x 64 -> 32 x 32 x 32
+            nn.Conv2d(img_channels, 32, 4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            # 32 x 32 x 32 -> 64 x 16 x 16
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            # 64 x 16 x 16 -> 128 x 8 x 8
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            # 128 x 8 x 8 -> 256 x 4 x 4
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+        )
+        
+        # Flatten to latent vector
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(256 * 4 * 4, latent_dim)
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.flatten(x)
+        z = self.fc(x)
+        return z
+
+
+class ConvDecoder(nn.Module):
+    def __init__(self, latent_dim=128, img_channels=3):
+        super(ConvDecoder, self).__init__()
+        
+        # Expand from latent vector
+        self.fc = nn.Linear(latent_dim, 256 * 4 * 4)
+        
+        # Output: 3 x 64 x 64
+        self.decoder = nn.Sequential(
+            # 256 x 4 x 4 -> 128 x 8 x 8
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            # 128 x 8 x 8 -> 64 x 16 x 16
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            # 64 x 16 x 16 -> 32 x 32 x 32
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            # 32 x 32 x 32 -> 3 x 64 x 64
+            nn.ConvTranspose2d(32, img_channels, 4, stride=2, padding=1),
+            nn.Sigmoid()  # Output range [0, 1]
+        )
+    
+    def forward(self, z):
+        x = self.fc(z)
+        x = x.view(-1, 256, 4, 4)  # Reshape to spatial dimensions
+        x = self.decoder(x)
+        return x
+
+
+class Autoencoder(nn.Module):
+    def __init__(self, img_channels=3, latent_dim=128):
+        super(Autoencoder, self).__init__()
+        self.encoder = ConvEncoder(img_channels, latent_dim)
+        self.decoder = ConvDecoder(latent_dim, img_channels)
+    
+    def forward(self, x):
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        return x_recon, z
+    
+    def encode(self, x):
+        return self.encoder(x)
+    
+    def decode(self, z):
+        return self.decoder(z)
+
+
+# ============================================================================
+# 2. DENOISING AUTOENCODER
+# ============================================================================
+
+class DenoisingAutoencoder(nn.Module):
+    """
+    Learns to reconstruct clean images from noisy inputs
+    More robust representations
+    """
+    def __init__(self, img_channels=3, latent_dim=128):
+        super(DenoisingAutoencoder, self).__init__()
+        self.encoder = ConvEncoder(img_channels, latent_dim)
+        self.decoder = ConvDecoder(latent_dim, img_channels)
+    
+    def add_noise(self, x, noise_factor=0.3):
+        """Add Gaussian noise to input"""
+        noisy = x + noise_factor * torch.randn_like(x)
+        noisy = torch.clamp(noisy, 0., 1.)
+        return noisy
+    
+    def forward(self, x, add_noise=True):
+        if add_noise and self.training:
+            x_noisy = self.add_noise(x)
+        else:
+            x_noisy = x
+        
+        z = self.encoder(x_noisy)
+        x_recon = self.decoder(z)
+        return x_recon, z, x_noisy
+
+
+# ============================================================================
+# 3. VARIATIONAL AUTOENCODER (VAE)
+# ============================================================================
+
+class VAEEncoder(nn.Module):
+    def __init__(self, img_channels=3, latent_dim=128):
+        super(VAEEncoder, self).__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Conv2d(img_channels, 32, 4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+        )
+        
+        self.flatten = nn.Flatten()
+        
+        # Output mean and log variance
+        self.fc_mu = nn.Linear(256 * 4 * 4, latent_dim)
+        self.fc_logvar = nn.Linear(256 * 4 * 4, latent_dim)
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.flatten(x)
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
+
+
+class VariationalAutoencoder(nn.Module):
+    """
+    Learns probabilistic latent space
+    Can generate new samples by sampling from latent distribution
+    """
+    def __init__(self, img_channels=3, latent_dim=128):
+        super(VariationalAutoencoder, self).__init__()
+        self.encoder = VAEEncoder(img_channels, latent_dim)
+        self.decoder = ConvDecoder(latent_dim, img_channels)
+        self.latent_dim = latent_dim
+    
+    def reparameterize(self, mu, logvar):
+        """Reparameterization trick: z = mu + sigma * epsilon"""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z
+    
+    def forward(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        x_recon = self.decoder(z)
+        return x_recon, mu, logvar
+    
+    def sample(self, num_samples, device):
+        """Generate new samples from latent space"""
+        z = torch.randn(num_samples, self.latent_dim).to(device)
+        samples = self.decoder(z)
+        return samples
+
+
+# ============================================================================
+# 4. SPARSE AUTOENCODER
+# ============================================================================
+
+class SparseAutoencoder(nn.Module):
+    """
+    Enforces sparsity in latent representation
+    Learns more robust features
+    """
+    def __init__(self, img_channels=3, latent_dim=128, sparsity_weight=0.001):
+        super(SparseAutoencoder, self).__init__()
+        self.encoder = ConvEncoder(img_channels, latent_dim)
+        self.decoder = ConvDecoder(latent_dim, img_channels)
+        self.sparsity_weight = sparsity_weight
+    
+    def forward(self, x):
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        
+        # L1 sparsity penalty
+        sparsity_loss = self.sparsity_weight * torch.mean(torch.abs(z))
+        
+        return x_recon, z, sparsity_loss
+
+
+# ============================================================================
+# 5. DATASET PREPARATION
+# ============================================================================
+
+def get_dataloader(data_path, img_size=64, batch_size=128, normalize=True):
+    """
+    Create dataloader for training
+    
+    Dataset structure:
+    data_path/
+        class1/
+            img1.jpg
+            img2.jpg
+        class2/
+            img1.jpg
+            img2.jpg
+    """
+    
+    if normalize:
+        # Normalize to [0, 1] for MSE loss and Sigmoid output
+        transform = transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+        ])
+    else:
+        # Normalize to [-1, 1] if using Tanh output
+        transform = transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    
+    dataset = datasets.ImageFolder(root=data_path, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
+    return dataloader
+
+
+# ============================================================================
+# 6. TRAINING LOOPS
+# ============================================================================
+
+class AutoencoderTrainer:
+    def __init__(self, model, device, lr=0.001):
+        self.model = model.to(device)
+        self.device = device
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
+        self.train_losses = []
+    
+    def train_step(self, images):
+        images = images.to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        # Forward pass
+        recon_images, z = self.model(images)
+        
+        # Calculate loss
+        loss = self.criterion(recon_images, images)
+        
+        # Backward pass
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+    
+    def train(self, dataloader, epochs=100, save_interval=10):
+        print(f"Starting training on {self.device}")
+        
+        for epoch in range(epochs):
+            epoch_loss = 0
+            
+            for i, (images, _) in enumerate(dataloader):
+                loss = self.train_step(images)
+                epoch_loss += loss
+                
+                if i % 50 == 0:
+                    print(f"Epoch [{epoch+1}/{epochs}] Batch [{i}/{len(dataloader)}] Loss: {loss:.6f}")
+            
+            # Average loss
+            avg_loss = epoch_loss / len(dataloader)
+            self.train_losses.append(avg_loss)
+            print(f"Epoch [{epoch+1}/{epochs}] Avg Loss: {avg_loss:.6f}")
+            
+            # Save reconstructions
+            if (epoch + 1) % save_interval == 0:
+                self.save_reconstructions(dataloader, epoch + 1)
+    
+    def save_reconstructions(self, dataloader, epoch):
+        """Save original vs reconstructed images"""
+        self.model.eval()
+        
+        # Get a batch of images
+        images, _ = next(iter(dataloader))
+        images = images[:8].to(self.device)
+        
+        with torch.no_grad():
+            recon_images, _ = self.model(images)
+        
+        # Concatenate original and reconstructed
+        comparison = torch.cat([images, recon_images])
+        
+        os.makedirs('reconstructions', exist_ok=True)
+        vutils.save_image(comparison, f'reconstructions/epoch_{epoch}.png', nrow=8)
+        
+        self.model.train()
+
+
+class VAETrainer:
+    def __init__(self, model, device, lr=0.001, beta=1.0):
+        """
+        beta: weight for KL divergence (beta-VAE)
+        beta > 1: more disentangled representations
+        beta < 1: better reconstructions
+        """
+        self.model = model.to(device)
+        self.device = device
+        self.beta = beta
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
+        self.train_losses = []
+    
+    def vae_loss(self, recon_x, x, mu, logvar):
+        """
+        VAE Loss = Reconstruction Loss + KL Divergence
+        """
+        # Reconstruction loss (MSE or BCE)
+        recon_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
+        
+        # KL divergence: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        
+        # Total loss
+        loss = recon_loss + self.beta * kl_div
+        
+        return loss, recon_loss, kl_div
+    
+    def train_step(self, images):
+        images = images.to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        # Forward pass
+        recon_images, mu, logvar = self.model(images)
+        
+        # Calculate loss
+        loss, recon_loss, kl_div = self.vae_loss(recon_images, images, mu, logvar)
+        
+        # Backward pass
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item(), recon_loss.item(), kl_div.item()
+    
+    def train(self, dataloader, epochs=100, save_interval=10):
+        print(f"Starting VAE training on {self.device}")
+        
+        for epoch in range(epochs):
+            epoch_loss = 0
+            epoch_recon = 0
+            epoch_kl = 0
+            
+            for i, (images, _) in enumerate(dataloader):
+                loss, recon, kl = self.train_step(images)
+                epoch_loss += loss
+                epoch_recon += recon
+                epoch_kl += kl
+                
+                if i % 50 == 0:
+                    print(f"Epoch [{epoch+1}/{epochs}] Batch [{i}/{len(dataloader)}]")
+                    print(f"  Loss: {loss:.4f} Recon: {recon:.4f} KL: {kl:.4f}")
+            
+            # Average losses
+            avg_loss = epoch_loss / len(dataloader)
+            avg_recon = epoch_recon / len(dataloader)
+            avg_kl = epoch_kl / len(dataloader)
+            
+            self.train_losses.append(avg_loss)
+            
+            print(f"\nEpoch [{epoch+1}/{epochs}] Summary:")
+            print(f"  Avg Loss: {avg_loss:.4f}")
+            print(f"  Avg Recon: {avg_recon:.4f}")
+            print(f"  Avg KL: {avg_kl:.4f}\n")
+            
+            if (epoch + 1) % save_interval == 0:
+                self.save_reconstructions(dataloader, epoch + 1)
+                self.save_samples(epoch + 1)
+    
+    def save_reconstructions(self, dataloader, epoch):
+        self.model.eval()
+        images, _ = next(iter(dataloader))
+        images = images[:8].to(self.device)
+        
+        with torch.no_grad():
+            recon_images, _, _ = self.model(images)
+        
+        comparison = torch.cat([images, recon_images])
+        os.makedirs('vae_reconstructions', exist_ok=True)
+        vutils.save_image(comparison, f'vae_reconstructions/epoch_{epoch}.png', nrow=8)
+        
+        self.model.train()
+    
+    def save_samples(self, epoch):
+        """Generate new samples from latent space"""
+        self.model.eval()
+        
+        with torch.no_grad():
+            samples = self.model.sample(64, self.device)
+        
+        os.makedirs('vae_samples', exist_ok=True)
+        vutils.save_image(samples, f'vae_samples/epoch_{epoch}.png', nrow=8)
+        
+        self.model.train()
+
+
+# ============================================================================
+# 7. USAGE EXAMPLE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Hyperparameters
+    LATENT_DIM = 128
+    IMG_SIZE = 64
+    IMG_CHANNELS = 3
+    BATCH_SIZE = 128
+    EPOCHS = 100
+    LR = 0.001
+    
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Choose model type
+    print("\n=== Available Models ===")
+    print("1. Vanilla Autoencoder")
+    print("2. Denoising Autoencoder")
+    print("3. Variational Autoencoder (VAE)")
+    print("4. Sparse Autoencoder")
+    
+    # Example: Vanilla Autoencoder
+    model = Autoencoder(img_channels=IMG_CHANNELS, latent_dim=LATENT_DIM)
+    trainer = AutoencoderTrainer(model, device, lr=LR)
+    
+    # Example: VAE
+    # model = VariationalAutoencoder(img_channels=IMG_CHANNELS, latent_dim=LATENT_DIM)
+    # trainer = VAETrainer(model, device, lr=LR, beta=1.0)
+    
+    # Load data (replace with your dataset path)
+    # dataloader = get_dataloader('path/to/your/dataset', IMG_SIZE, BATCH_SIZE)
+    
+    # Train
+    # trainer.train(dataloader, epochs=EPOCHS)
+    
+    # Save model
+    # torch.save(model.state_dict(), 'autoencoder.pth')
+from diffusers import DiffusionPipeline
+import torch
+
+pipe = DiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16
+).to("cuda")
+image = pipe("a futuristic robot on mars").images[0]
+image.save("out.png")
+from PIL import Image
+
+init = Image.open("input.png")
+
+image = pipe.img2img(
+    prompt="convert to watercolor style",
+    image=init,
+    strength=0.7
+).images[0]
+from diffusers import StableDiffusionInpaintPipeline
+import torch
+
+pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    "runwayml/stable-diffusion-inpainting-1.5",
+    torch_dtype=torch.float16
+).to("cuda")
+
+image = pipe(
+    prompt="replace with a steel robot",
+    image=init_image,
+    mask_image=mask,
+).images[0]
+pipe = DiffusionPipeline.from_pretrained("stabilityai/sd-x2-latent-upscaler")
+image = pipe(prompt="upscale", image=lowres).images[0]
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from diffusers import (
+    StableDiffusionPipeline,
+    DDPMScheduler,
+)
+from peft import LoraConfig, get_peft_model
+from PIL import Image
+from accelerate import Accelerator
+import os
+import json
+import random
+
+# ============================================================
+# 1. CONFIG
+# ============================================================
+MODEL_NAME = "runwayml/stable-diffusion-v1-5"
+OUTPUT_DIR = "./lora-output"
+DATA_PATH = "./dataset"  # folder of images + captions.json
+
+LR = 1e-4
+BATCH_SIZE = 1
+EPOCHS = 1
+RANK = 8
+IMAGE_SIZE = 512
+
+# ============================================================
+# 2. DATASET
+# ============================================================
+
+class Text2ImageDataset(Dataset):
+    def __init__(self, image_folder, captions_file, size=512):
+        self.size = size
+        self.image_folder = image_folder
+        with open(captions_file, "r") as f:
+            self.prompts = json.load(f)   # {"IMG_1.png": "prompt text", ...}
+        self.keys = list(self.prompts.keys())
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        fname = self.keys[idx]
+        prompt = self.prompts[fname]
+
+        img = Image.open(os.path.join(self.image_folder, fname)).convert("RGB")
+        img = img.resize((self.size, self.size))
+        img = torch.from_numpy((torch.tensor(img).permute(2, 0, 1) / 255.).numpy()).float()
+
+        return {
+            "pixel_values": img,
+            "prompt": prompt
+        }
+
+# ============================================================
+# 3. LOAD PIPELINE
+# ============================================================
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16
+)
+
+vae = pipe.vae
+tokenizer = pipe.tokenizer
+text_encoder = pipe.text_encoder
+unet = pipe.unet
+noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+
+# ============================================================
+# 4. INJECT LORA INTO UNET
+# ============================================================
+
+lora_config = LoraConfig(
+    r=RANK,
+    lora_alpha=16,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0"],  # SD-attn layers
+    lora_dropout=0.05,
+    bias="none",
+    task_type="UNET_CAUSAL_LM"
+)
+
+unet = get_peft_model(unet, lora_config)
+unet.print_trainable_parameters()
+
+# ============================================================
+# 5. DATA LOADER
+# ============================================================
+
+dataset = Text2ImageDataset(DATA_PATH, os.path.join(DATA_PATH, "captions.json"))
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# ============================================================
+# 6. ACCELERATOR
+# ============================================================
+
+accelerator = Accelerator(
+    mixed_precision="fp16",
+    gradient_accumulation_steps=1
+)
+
+unet, text_encoder, optimizer, dataloader = accelerator.prepare(
+    unet,
+    text_encoder,
+    torch.optim.AdamW(unet.parameters(), lr=LR),
+    dataloader
+)
+
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+pipe.unet = unet  # register updated UNet
+
+# ============================================================
+# 7. TRAINING LOOP
+# ============================================================
+
+global_step = 0
+for epoch in range(EPOCHS):
+    for batch in dataloader:
+
+        # ---- Encode prompt ----
+        text = tokenizer(
+            batch["prompt"],
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        text_input_ids = text.input_ids.to(accelerator.device)
+        encoder_hidden_states = text_encoder(text_input_ids)[0]
+
+        # ---- Encode image to latents ----
+        imgs = batch["pixel_values"].to(torch.float16).to(accelerator.device)
+        imgs = imgs.unsqueeze(0) if imgs.ndim == 3 else imgs
+        latents = vae.encode(imgs).latent_dist.sample() * 0.18215
+
+        # ---- Add noise ----
+        bsz = latents.shape[0]
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                                  (bsz,), device=accelerator.device).long()
+
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # ---- Predict noise via UNet ----
+        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        loss = F.mse_loss(model_pred, noise)
+
+        accelerator.backward(loss)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        global_step += 1
+
+        if accelerator.is_main_process and global_step % 20 == 0:
+            print(f"Step {global_step} | Loss: {loss.item():.4f}")
+
+# ============================================================
+# 8. SAVE LORA WEIGHTS
+# ============================================================
+
+if accelerator.is_main_process:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    unet.save_pretrained(os.path.join(OUTPUT_DIR, "lora-unet"))
+    print("LoRA saved to:", OUTPUT_DIR)
+
+# ============================================================
+# 9. LOAD FINETUNED LORA (FOR INFERENCE)
+# ============================================================
+"""
+from diffusers import StableDiffusionPipeline
+pipe = StableDiffusionPipeline.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to("cuda")
+pipe.unet.load_attn_procs("./lora-output/lora-unet")
+image = pipe("your prompt", num_inference_steps=25).images[0]
+image.save("result.png")
+"""
+# ============================================================
+#               YOLO OBJECT DETECTION CHEATSHEET
+#      (Training, Inference, Validation, Custom Dataset)
+# ============================================================
+# This cheatsheet uses the ULTRALYTICS YOLOv8 API.
+# Covers:
+#   ✔ Training on custom dataset
+#   ✔ Dataset YAML format example
+#   ✔ Inference on images / videos / webcam
+#   ✔ Exporting to ONNX / TensorRT
+#   ✔ Tracking
+#   ✔ Validation / metrics
+#   ✔ Real-time streaming
+#   ✔ Use-case comments above each block
+# ============================================================
+
+# Install YOLO if needed:
+# pip install ultralytics
+
+from ultralytics import YOLO
+
+# ============================================================
+# 1. LOAD MODEL (pretrained or custom)
+# ============================================================
+# Use-case: load a pretrained detection model (YOLOv8n = fastest)
+model = YOLO("yolov8n.pt")  
+# model = YOLO("yolov8s.pt")  # more accurate
+# model = YOLO("runs/detect/train/weights/best.pt")  # load custom trained
+
+# ============================================================
+# 2. TRAIN ON CUSTOM DATASET
+# ============================================================
+# Use-case: train YOLO from scratch or finetune on your data.
+# Requirements: a dataset.yaml file pointing to train/val images.
+results = model.train(
+    data="dataset.yaml",   # <-- your YAML file
+    epochs=50,
+    imgsz=640,
+    batch=8,
+    lr0=0.001,
+    device=0,
+)
+
+
+# ============================================================
+# 3. DATASET YAML EXAMPLE (PUT IN dataset.yaml)
+# ============================================================
+# Use-case: define custom dataset structure.
+# Paste this YAML into dataset.yaml file:
+"""
+path: ./dataset                 # dataset root folder
+train: images/train
+val: images/val
+
+# number of classes
+nc: 3
+
+# class names
+names: ["person", "helmet", "smoke"]
+"""
+
+
+# ============================================================
+# 4. BASIC INFERENCE (IMAGE)
+# ============================================================
+# Use-case: detect objects in a single image
+results = model("test.jpg")
+results[0].show()              # display detections
+results[0].save("result.jpg")  # save result
+
+
+# ============================================================
+# 5. INFERENCE ON VIDEO
+# ============================================================
+# Use-case: detect objects on videos frame-by-frame
+model.predict(
+    source="test_video.mp4",
+    save=True,
+    conf=0.25,
+    device=0
+)
+
+
+# ============================================================
+# 6. REAL-TIME WEBCAM DETECTION
+# ============================================================
+# Use-case: live camera object detection (0 = default webcam)
+model.predict(
+    source=0,
+    show=True,
+    conf=0.35,
+    device=0
+)
+
+
+# ============================================================
+# 7. EXPORT MODEL (ONNX / TensorRT / CoreML)
+# ============================================================
+# Use-case: deploy YOLO model into mobile, cloud, embedded devices.
+model.export(format="onnx")      # ONNX for ML frameworks
+model.export(format="engine")    # NVIDIA TensorRT
+model.export(format="coreml")    # Apple devices
+model.export(format="tflite")    # Android/Edge
+model.export(format="openvino")  # Intel hardware
+
+
+# ============================================================
+# 8. TRACKING (BYTETrack, StrongSORT, etc.)
+# ============================================================
+# Use-case: track objects across multiple frames in video.
+model.track(
+    source="street.mp4",
+    save=True,
+    tracker="bytetrack.yaml",   # built-in tracker
+    conf=0.4
+)
+
+
+# ============================================================
+# 9. VALIDATION (mAP, Precision, Recall)
+# ============================================================
+# Use-case: evaluate the trained model on validation set.
+metrics = model.val(
+    data="dataset.yaml",
+    conf=0.25,
+)
+print(metrics)
+
+
+# ============================================================
+# 10. CUSTOM TRAINING TRICKS FOR IOAI
+# ============================================================
+# Use-case: apply advanced training options
+model.train(
+    data="dataset.yaml",
+    epochs=100,
+    imgsz=640,
+    batch=16,
+    lr0=5e-4,                # lower LR for finetuning
+    mosaic=0.7,              # augmentation
+    hsv_h=0.015,             # color augmentation
+    fliplr=0.5,              # left-right flip
+    mixup=0.2,
+    box=7.5, cls=2.0, dfl=1.5,  # loss weights
+    device=0
+)
+
+
+# ============================================================
+# 11. PYTHONIC LOW-LEVEL INFERENCE (get boxes programmatically)
+# ============================================================
+# Use-case: get bounding boxes, class IDs, scores inside code.
+results = model("image.jpg")[0]
+
+for box in results.boxes:
+    xyxy = box.xyxy[0].tolist()    # [x1, y1, x2, y2]
+    conf  = float(box.conf[0])     # confidence
+    cls   = int(box.cls[0])        # class index
+    print("Box:", xyxy, "Conf:", conf, "Class:", cls)
+
+
+# ============================================================
+# 12. SAVE RESULTS TO CSV / JSON
+# ============================================================
+# Use-case: export detections for competitions or analytics.
+import pandas as pd
+
+rows = []
+for box in results.boxes:
+    rows.append({
+        "x1": float(box.xyxy[0][0]),
+        "y1": float(box.xyxy[0][1]),
+        "x2": float(box.xyxy[0][2]),
+        "y2": float(box.xyxy[0][3]),
+        "conf": float(box.conf[0]),
+        "class": int(box.cls[0])
+    })
+
+pd.DataFrame(rows).to_csv("detections.csv", index=False)
+
+
+# ============================================================
+# 13. TRAIN FROM ZERO (NO PRETRAINED)
+# ============================================================
+# Use-case: fully custom-trained detector for specialized domain.
+model = YOLO("yolov8n.yaml")  # architecture only
+model.train(
+    data="dataset.yaml",
+    epochs=200,
+    imgsz=640,
+)
+
+
+# ============================================================
+# 14. CALLBACKS (CUSTOM LOGIC DURING TRAINING)
+# ============================================================
+# Use-case: save custom metrics, early stopping, etc.
+class MyCallback:
+    def on_fit_epoch_end(self, trainer):
+        print("Epoch:", trainer.epoch)
+
+model.add_callback("on_fit_epoch_end", MyCallback())
+
+
+# ============================================================
+# End of YOLO Object Detection Cheatsheet
+# Everything in one code block.
+# Copy-Paste & Run.
+# ============================================================
