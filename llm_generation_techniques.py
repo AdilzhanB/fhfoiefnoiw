@@ -822,3 +822,115 @@ def batch_inference(model, tokenizer, prompts, batch_size=8):
         results.extend(batch_results)
     
     return results
+import os
+from pathlib import Path
+
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+
+# Google Embeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+# Reranker
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+# LLM
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+
+DATA_DIR = Path("data")
+PERSIST_DIR = "chroma_db"
+EMBED_MODEL = "text-embedding-004"
+
+# -------------------------
+# 1) Load corpus
+# -------------------------
+loader = TextLoader(str(DATA_DIR / "corpus.txt"), encoding="utf-8")
+docs = loader.load()
+
+# -------------------------
+# 2) Chunking
+# -------------------------
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=900,
+    chunk_overlap=150
+)
+chunks = splitter.split_documents(docs)
+
+# -------------------------
+# 3) Google Embeddings
+# -------------------------
+embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
+
+# -------------------------
+# 4) Create VectorStore
+# -------------------------
+vectordb = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings,
+    persist_directory=PERSIST_DIR
+)
+vectordb.persist()
+
+
+# ============================================================================
+#                 ★★★★★  RERANKER (bge-reranker-large)  ★★★★★
+# ============================================================================
+
+class CrossEncoderReranker:
+    def __init__(self, model_name="BAAI/bge-reranker-large"):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.model.eval()
+
+    def rerank(self, query, docs, top_k=4):
+        pairs = [[query, doc.page_content] for doc in docs]
+        tokens = self.tokenizer(pairs, padding=True, truncation=True, return_tensors="pt")
+        with torch.no_grad():
+            scores = self.model(**tokens).logits.squeeze()
+        scores = scores.numpy()
+
+        ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        return [d for d, s in ranked[:top_k]]
+
+
+reranker = CrossEncoderReranker()
+
+
+# ============================================================================
+#                           RAG PIPELINE
+# ============================================================================
+
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+
+def rag_answer(query):
+    # 1) векторный поиск
+    retrieved = vectordb.similarity_search(query, k=15)
+
+    # 2) реранкинг
+    best_docs = reranker.rerank(query, retrieved, top_k=4)
+
+    # 3) сбор контекста
+    context = "\n\n".join([d.page_content for d in best_docs])
+
+    # 4) финальный ответ LLM
+    prompt = f"""
+Ты — эксперт. Ответь на основе контекста ниже.
+
+Контекст:
+{context}
+
+Вопрос:
+{query}
+
+Ответ:
+"""
+    return llm.predict(prompt)
+
+
+# ----------------------------------------
+# Пример запроса
+# ----------------------------------------
+print(rag_answer("Объясни основные причины кризиса Римской Империи"))
