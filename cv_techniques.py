@@ -1715,10 +1715,259 @@ class MyCallback:
         print("Epoch:", trainer.epoch)
 
 model.add_callback("on_fit_epoch_end", MyCallback())
+import os
+import cv2
+import zipfile
+import random
+import numpy as np
+from glob import glob
+from tqdm.notebook import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import segmentation_models_pytorch as smp
 
+# --- Configuration Dictionary ---
+CONFIG = {
+    "IMAGE_SIZE": 512, 
+    "BATCH_SIZE": 8, 
+    "EPOCHS": 40, 
+    "LEARNING_RATE": 2e-4, 
+    "ENCODER_NAME": "efficientnet-b4", 
+    "ENCODER_WEIGHTS": "imagenet", 
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu", 
+    "SEED_VALUE": 42
+}
 
-# ============================================================
-# End of YOLO Object Detection Cheatsheet
-# Everything in one code block.
-# Copy-Paste & Run.
-# ============================================================
+def set_global_seed(seed_value):
+    """Sets seeds for reproducibility."""
+    random.seed(seed_value)
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.backends.cudnn.deterministic = True
+
+set_global_seed(CONFIG["SEED_VALUE"])
+
+# --- Dataset Class for Segmentation ---
+class SegmentationDataset(Dataset):
+    def __init__(self, image_paths, mask_paths=None, apply_augmentation=False):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.image_size = CONFIG["IMAGE_SIZE"]
+        
+        # Define Albumentations transformations
+        if apply_augmentation:
+            self.transform = A.Compose([
+                A.Resize(self.image_size, self.image_size),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.ShiftScaleRotate(shift_limit=0.06, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.OneOf([
+                    A.GridDistortion(num_steps=5, distort_limit=0.05, p=1.0),
+                    A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=1.0)
+                ], p=0.3),
+                A.CoarseDropout(max_holes=8, max_height=self.image_size//20, max_width=self.image_size//20, fill_value=0, p=0.2),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+        else:
+            self.transform = A.Compose([
+                A.Resize(self.image_size, self.image_size),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        image = cv2.imread(self.image_paths[index], cv2.IMREAD_COLOR)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if self.mask_paths: # Training/Validation mode
+            mask = cv2.imread(self.mask_paths[index], cv2.IMREAD_GRAYSCALE)
+            # Convert mask to binary float tensor (0 or 1)
+            mask = (mask > 127).astype("float32") 
+            
+            augmented = self.transform(image=image, mask=mask)
+            # Add channel dimension to mask (C, H, W)
+            return augmented["image"], augmented["mask"].unsqueeze(0) 
+        else: # Inference/Test mode
+            original_height, original_width = image.shape[:2]
+            augmented = self.transform(image=image)
+            # Return image, original path, and original dimensions
+            return augmented["image"], self.image_paths[index], (original_height, original_width) 
+
+# --- Training Function ---
+def train_model(train_loader, validation_loader):
+    # Initialize UnetPlusPlus model
+    model = smp.UnetPlusPlus(
+        encoder_name=CONFIG["ENCODER_NAME"], 
+        encoder_weights=CONFIG["ENCODER_WEIGHTS"], 
+        in_channels=3, 
+        classes=1, 
+        activation=None
+    ).to(CONFIG["DEVICE"])
+    
+    # Define Loss Functions
+    dice_loss_fn = smp.losses.DiceLoss(mode="binary")
+    bce_loss_fn = nn.BCEWithLogitsLoss()
+    
+    # Optimizer and Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["LEARNING_RATE"], weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["EPOCHS"], eta_min=1e-6)
+    
+    # GradScaler for Mixed Precision Training
+    scaler = GradScaler()
+    best_loss = float('inf')
+    best_model_path = "best_model.pth"
+
+    for epoch in range(CONFIG["EPOCHS"]):
+        model.train()
+        train_loss_sum = 0
+        train_loop = tqdm(train_loader)
+        
+        # Training loop
+        for images, masks in train_loop:
+            images, masks = images.to(CONFIG["DEVICE"]), masks.to(CONFIG["DEVICE"])
+            optimizer.zero_grad()
+            
+            with autocast(): # Mixed precision
+                predictions = model(images)
+                # Combined Loss: 0.5 * Dice Loss + 0.5 * BCE Loss
+                loss = 0.5 * dice_loss_fn(torch.sigmoid(predictions), masks) + 0.5 * bce_loss_fn(predictions, masks)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss_sum += loss.item()
+        
+        # Validation loop
+        model.eval()
+        validation_loss_sum = 0
+        with torch.no_grad():
+            for images, masks in validation_loader:
+                images, masks = images.to(CONFIG["DEVICE"]), masks.to(CONFIG["DEVICE"])
+                with autocast():
+                    predictions = model(images)
+                    loss = 0.5 * dice_loss_fn(torch.sigmoid(predictions), masks) + 0.5 * bce_loss_fn(predictions, masks)
+                validation_loss_sum += loss.item()
+        
+        average_validation_loss = validation_loss_sum / len(validation_loader)
+        
+        # Print epoch results
+        print(f"Epoch {epoch+1:02d} | Train Loss: {train_loss_sum/len(train_loader):.4f} | Validation Loss: {average_validation_loss:.4f}")
+        
+        # Scheduler step and Checkpoint saving
+        scheduler.step()
+        if average_validation_loss < best_loss:
+            best_loss = average_validation_loss
+            torch.save(model.state_dict(), best_model_path)
+            
+    return best_model_path
+
+# --- Prediction Function ---
+def predict_masks(model_path, test_directory, output_directory):
+    os.makedirs(output_directory, exist_ok=True)
+    
+    # Initialize model for inference
+    model = smp.UnetPlusPlus(
+        encoder_name=CONFIG["ENCODER_NAME"], 
+        encoder_weights=None, 
+        in_channels=3, 
+        classes=1
+    ).to(CONFIG["DEVICE"])
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    
+    # Prepare DataLoader
+    image_paths = sorted(glob(f"{test_directory}/*.png"))
+    test_dataset = SegmentationDataset(image_paths, apply_augmentation=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    with torch.no_grad():
+        for images, original_path, (original_height, original_width) in tqdm(test_loader):
+            images = images.to(CONFIG["DEVICE"])
+            
+            # Test-Time Augmentation (TTA): Original, Horizontal Flip, Vertical Flip
+            prediction_original = torch.sigmoid(model(images))
+            
+            prediction_hflip = torch.sigmoid(model(torch.flip(images, [3])))
+            prediction_hflip = torch.flip(prediction_hflip, [3]) # Flip back
+            
+            prediction_vflip = torch.sigmoid(model(torch.flip(images, [2])))
+            prediction_vflip = torch.flip(prediction_vflip, [2]) # Flip back
+            
+            # Average predictions from TTA
+            average_prediction = (prediction_original + prediction_hflip + prediction_vflip) / 3.0
+            
+            # Post-processing
+            mask_np = average_prediction[0, 0].cpu().numpy()
+            
+            # Resize back to original image dimensions
+            resized_mask = cv2.resize(mask_np, (original_width.item(), original_height.item()))
+            
+            # Thresholding and saving as 8-bit image (0 or 255)
+            final_mask = (resized_mask > 0.5).astype("uint8") * 255
+            
+            # Save the mask
+            image_filename = os.path.basename(original_path[0])
+            output_filepath = os.path.join(output_directory, image_filename)
+            cv2.imwrite(output_filepath, final_mask)
+
+# --- Zipping Function ---
+def create_submission_zip(masks_directory, zip_filename="submission.zip"):
+    """Creates a zip file containing all predicted masks."""
+    with zipfile.ZipFile(zip_filename, 'w') as zip_file:
+        for filepath in sorted(glob(masks_directory + "/*.png")):
+            # Write the file using only its base name
+            zip_file.write(filepath, os.path.basename(filepath))
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # 1. Prepare data paths
+    train_image_paths = sorted(glob("train/images/*.png"))
+    train_mask_paths = sorted(glob("train/masks/*.png"))
+    
+    # 2. Split data into train and validation sets (90/10 split)
+    split_index = int(0.9 * len(train_image_paths))
+    
+    tr_images = train_image_paths[:split_index]
+    tr_masks = train_mask_paths[:split_index]
+    vl_images = train_image_paths[split_index:]
+    vl_masks = train_mask_paths[split_index:]
+    
+    # 3. Create Dataset and DataLoader instances
+    train_dataset = SegmentationDataset(tr_images, tr_masks, apply_augmentation=True)
+    validation_dataset = SegmentationDataset(vl_images, vl_masks, apply_augmentation=False)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=CONFIG["BATCH_SIZE"], 
+        shuffle=True, 
+        num_workers=2, 
+        pin_memory=True
+    )
+    validation_loader = DataLoader(
+        validation_dataset, 
+        batch_size=CONFIG["BATCH_SIZE"], 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=True
+    )
+    
+    # 4. Train the model
+    best_model_path = train_model(train_loader, validation_loader)
+    
+    # 5. Predict on test images
+    predict_masks(best_model_path, "test/images", "preds")
+    
+    # 6. Create submission zip file
+    create_submission_zip("preds")
