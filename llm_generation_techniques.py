@@ -929,8 +929,195 @@ def rag_answer(query):
 """
     return llm.predict(prompt)
 
-
 # ----------------------------------------
 # Пример запроса
 # ----------------------------------------
 print(rag_answer("Объясни основные причины кризиса Римской Империи"))
+import os
+import torch
+from typing import List
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.llms import VLLM
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+# ==============================================================================
+# CONFIGURATION & OPTIMIZATION SETTINGS
+# ==============================================================================
+# NOTE: Replace 'Qwen/Qwen2.5-7B-Instruct-FP8' if Qwen3 is not yet public on HF.
+# This setup assumes a GPU with at least 24GB VRAM (3090/4090/A10G).
+
+CONFIG = {
+    "llm_model_id": "Qwen/Qwen2.5-7B-Instruct-FP8", # Using 2.5 FP8 as proxy for 3
+    "embedding_model_id": "Alibaba-NLP/gte-Qwen2-1.5B-instruct", # The "Qwen" embedding
+    "reranker_model_id": "BAAI/bge-reranker-v2-m3",
+    "vector_db_path": "./chroma_db_qwen",
+    "chunk_size": 1000,
+    "chunk_overlap": 200,
+    # VLLM Optimization: Leave VRAM for the embedding/reranker models
+    "gpu_memory_utilization": 0.7, 
+    "max_model_len": 8192,
+    "quantization": "fp8", 
+    "dtype": "auto",
+    "top_k_retrieval": 20, # Fetch 20 docs
+    "top_k_reranked": 5    # Pass only the best 5 to LLM
+}
+
+class OptimizedQwenRAG:
+    def __init__(self):
+        print(f"🚀 Initializing RAG Pipeline with {CONFIG['llm_model_id']}...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # 1. Initialize Embeddings (Qwen GTE)
+        # We put this on CUDA but be mindful of VRAM. 
+        print(f"🔹 Loading Embedding Model: {CONFIG['embedding_model_id']}")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=CONFIG['embedding_model_id'],
+            model_kwargs={"device": self.device, "trust_remote_code": True},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+
+        # 2. Initialize Vector Store (ChromaDB)
+        print("🔹 Initializing ChromaDB...")
+        self.vectorstore = Chroma(
+            persist_directory=CONFIG["vector_db_path"],
+            embedding_function=self.embeddings,
+            collection_name="qwen_knowledge_base"
+        )
+
+        # 3. Initialize Reranker (BGE)
+        # Rerankers are heavy but crucial for accuracy.
+        print(f"🔹 Loading Reranker: {CONFIG['reranker_model_id']}")
+        self.reranker_model = HuggingFaceCrossEncoder(
+            model_name=CONFIG["reranker_model_id"], 
+            model_kwargs={"device": self.device}
+        )
+        
+        # 4. Initialize LLM (VLLM)
+        # VLLM runs efficiently, but we strictly control its memory claim.
+        print(f"🔹 Spinning up VLLM Engine ({CONFIG['quantization']})...")
+        self.llm = VLLM(
+            model=CONFIG["llm_model_id"],
+            trust_remote_code=True,
+            max_new_tokens=1024,
+            top_k=10,
+            top_p=0.95,
+            temperature=0.1,
+            # VLLM Specific Optimizations
+            vllm_kwargs={
+                "quantization": CONFIG["quantization"],
+                "gpu_memory_utilization": CONFIG["gpu_memory_utilization"],
+                "max_model_len": CONFIG["max_model_len"],
+                "enforce_eager": True, # Helps prevent CUDA graph capture issues in mixed pipelines
+                "tensor_parallel_size": 1, # Increase if using multiple GPUs
+            },
+        )
+
+        self.retriever = self._build_retriever()
+        self.chain = self._build_chain()
+
+    def _build_retriever(self):
+        """
+        Creates a 2-stage retriever:
+        1. Semantic Search (Vector) -> Retrieves top 20
+        2. Cross-Encoder (BGE) -> Reranks and keeps top 5
+        """
+        base_retriever = self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": CONFIG["top_k_retrieval"]}
+        )
+
+        compressor = CrossEncoderReranker(
+            model=self.reranker_model, 
+            top_n=CONFIG["top_k_reranked"]
+        )
+
+        compression_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor, 
+            base_retriever=base_retriever
+        )
+        return compression_retriever
+
+    def _build_chain(self):
+        """
+        Builds the LCEL (LangChain Expression Language) Chain.
+        Uses Qwen specific ChatML template.
+        """
+        # Qwen/ChatML Prompt Structure
+        template = """<|im_start|>system
+You are a helpful assistant. Use the following context to answer the user's question. 
+If the answer is not in the context, say you don't know.
+Context:
+{context}
+<|im_end|>
+<|im_start|>user
+{question}<|im_end|>
+<|im_start|>assistant
+"""
+        prompt = ChatPromptTemplate.from_template(template)
+
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
+        chain = (
+            {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | self.llm
+            | StrOutputParser()
+        )
+        return chain
+
+    def ingest_text(self, text_content: str):
+        """Ingests raw text, chunks it, and saves to Chroma."""
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CONFIG["chunk_size"],
+            chunk_overlap=CONFIG["chunk_overlap"]
+        )
+        docs = splitter.create_documents([text_content])
+        self.vectorstore.add_documents(docs)
+        print(f"✅ Ingested {len(docs)} chunks into ChromaDB.")
+
+    def query(self, question: str):
+        """Runs the full RAG pipeline."""
+        print(f"\n❓ Question: {question}")
+        print("🔍 Retrieving & Reranking...")
+        
+        # We can inspect retrieved docs if needed, but here we run the chain
+        response = self.chain.invoke(question)
+        
+        print("-" * 50)
+        print(f"💡 Answer:\n{response}")
+        print("-" * 50)
+        return response
+
+# ==============================================================================
+# EXECUTION EXAMPLE
+# ==============================================================================
+if __name__ == "__main__":
+    # 1. Initialize System
+    rag_system = OptimizedQwenRAG()
+
+    # 2. Simulate Data Ingestion (Replace with your PDF/Text loaders)
+    sample_text = """
+    Qwen2.5 is the latest series of large language models from Alibaba Cloud. 
+    It features significant improvements in coding, mathematics, and multilingual capabilities.
+    The architecture uses SwiGLU activation, RoPE, and window attention.
+    It supports a context window of up to 128k tokens.
+    
+    The FP8 quantization allows the model to run on consumer hardware with minimal accuracy loss.
+    VLLM (Versatile Large Language Model) serving engine optimizes memory paging (PagedAttention) 
+    to increase throughput by 2x-4x compared to standard HuggingFace implementations.
+    """
+    
+    rag_system.ingest_text(sample_text)
+
+    # 3. Run Query
+    rag_system.query("What are the key technical features of Qwen2.5?")
+    rag_system.query("How does VLLM improve performance?")
