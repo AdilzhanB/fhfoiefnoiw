@@ -1971,3 +1971,160 @@ if __name__ == "__main__":
     
     # 6. Create submission zip file
     create_submission_zip("preds")
+!pip install transformers -q
+import os
+import glob
+import torch
+import pandas as pd
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from transformers import CLIPProcessor, CLIPModel
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+TRAIN_DIR = "/kaggle/input/iaio-2026-sf-r-image-classification/train_img/train"
+TEST_DIR = "/kaggle/input/iaio-2026-sf-r-image-classification/test_img/test"
+SUBMISSION_FILE = "submission.csv"
+
+# Using the high-resolution Large model from OpenAI
+MODEL_ID = "openai/clip-vit-large-patch14-336"
+BATCH_SIZE = 32
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Running on {DEVICE} using {MODEL_ID}")
+
+# ==========================================
+# 2. DATA PREPARATION
+# ==========================================
+
+# Get Class Names
+class_names = sorted([d for d in os.listdir(TRAIN_DIR) if os.path.isdir(os.path.join(TRAIN_DIR, d))])
+print(f"Classes found: {len(class_names)}")
+
+# Load HuggingFace Model and Processor
+model = CLIPModel.from_pretrained(MODEL_ID).to(DEVICE)
+processor = CLIPProcessor.from_pretrained(MODEL_ID)
+
+# Custom Test Dataset
+class TestDataset(Dataset):
+    def __init__(self, folder_path):
+        self.filepaths = glob.glob(os.path.join(folder_path, "*.*"))
+        
+    def __len__(self):
+        return len(self.filepaths)
+
+    def __getitem__(self, idx):
+        path = self.filepaths[idx]
+        image = Image.open(path).convert("RGB")
+        return image, os.path.basename(path)
+
+# Collate function to handle the processor (resizing/normalization) inside the loader
+def collate_fn(batch):
+    images = [item[0] for item in batch]
+    filenames = [item[1] for item in batch]
+    # Processor handles resizing and normalization automatically
+    inputs = processor(images=images, return_tensors="pt")
+    return inputs['pixel_values'], filenames
+
+test_dataset = TestDataset(TEST_DIR)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, collate_fn=collate_fn)
+
+# ==========================================
+# 3. THE CHERRY: PROMPT ENSEMBLING
+# ==========================================
+print("Building Text Prototypes with Prompt Ensembling...")
+
+# Multiple templates to capture different aspects of the images
+templates = [
+    "a photo of the district of {}.",
+    "a street view in {}.",
+    "architecture in {}.",
+    "a driving scenario in {}.",
+    "buildings and roads in {}.",
+    "this is a photo of some area, street and district in {}."
+]
+
+def build_text_prototypes(classes, templates):
+    """
+    Generates an averaged text embedding for each class based on multiple templates.
+    """
+    model.eval()
+    zeroshot_weights = []
+
+    with torch.no_grad():
+        for classname in tqdm(classes, desc="Encoding Classes"):
+            # 1. Fill templates for this specific class
+            texts = [template.format(classname) for template in templates]
+            
+            # 2. Tokenize
+            inputs = processor(text=texts, padding=True, return_tensors="pt").to(DEVICE)
+            
+            # 3. Get Embeddings for all templates of this class
+            class_embeddings = model.get_text_features(**inputs)
+            
+            # 4. Normalize individual template embeddings
+            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
+            
+            # 5. Average them to get the single "Prototype" for this class
+            class_embedding = class_embeddings.mean(dim=0)
+            
+            # 6. Normalize the final prototype
+            class_embedding /= class_embedding.norm()
+            
+            zeroshot_weights.append(class_embedding)
+            
+    # Stack into a matrix: [Num_Classes, Embed_Dim]
+    return torch.stack(zeroshot_weights).T
+
+# Create the text features matrix
+# Shape: [Embed_Dim, Num_Classes]
+text_features = build_text_prototypes(class_names, templates)
+
+# ==========================================
+# 4. INFERENCE LOOP
+# ==========================================
+print("Starting Inference...")
+
+filenames_list = []
+predictions_list = []
+
+model.eval()
+with torch.no_grad():
+    for images, filenames in tqdm(test_loader):
+        images = images.to(DEVICE)
+        
+        # 1. Get Image Features
+        image_features = model.get_image_features(pixel_values=images)
+        
+        # 2. Normalize Image Features
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+        
+        # 3. Calculate Cosine Similarity
+        # (Batch, Dim) @ (Dim, Classes) -> (Batch, Classes)
+        similarity = (100.0 * image_features @ text_features)
+        
+        # 4. Get Top Prediction
+        # softmax is optional here, argmax works the same for hard classification
+        _, preds = similarity.topk(1, dim=-1)
+        
+        predictions_list.extend(preds.squeeze().cpu().numpy())
+        filenames_list.extend(filenames)
+
+# ==========================================
+# 5. SUBMISSION
+# ==========================================
+
+# Map indices back to class names
+final_labels = [class_names[i] for i in predictions_list]
+
+submission = pd.DataFrame({
+    'path': filenames_list,
+    'labels': final_labels
+})
+
+submission.to_csv(SUBMISSION_FILE, index=False)
+print(f"Submission saved to {SUBMISSION_FILE}")
+print(submission.head())
