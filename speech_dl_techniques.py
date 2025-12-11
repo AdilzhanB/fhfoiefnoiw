@@ -923,3 +923,430 @@ def main():
 
 if __name__ == "__main__":
     main()
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    WhisperFeatureExtractor, 
+    WhisperModel, 
+    TrainingArguments, 
+    Trainer
+)
+from torch import nn
+import evaluate
+
+# --- CONFIGURATION ---
+MODEL_CHECKPOINT = "openai/whisper-tiny"
+dataset_name = "superb"
+dataset_config = "ks"  # Keyword Spotting
+batch_size = 32
+num_labels = 12  # The dataset has 12 keywords (yes, no, up, down, etc.)
+MAX_DURATION = 1.0 # Seconds (short for keyword spotting)
+
+# 1. LOAD DATASET
+# ---------------------------------------------------------
+print("Loading dataset...")
+dataset = load_dataset(dataset_name, dataset_config)
+
+# Label mapping (Label ID -> Name)
+labels = dataset["train"].features["label"].names
+label2id, id2label = dict(), dict()
+for i, label in enumerate(labels):
+    label2id[label] = str(i)
+    id2label[str(i)] = label
+
+# 2. PREPROCESSING
+# ---------------------------------------------------------
+feature_extractor = WhisperFeatureExtractor.from_pretrained(MODEL_CHECKPOINT)
+
+def preprocess_function(examples):
+    audio_arrays = [x["array"] for x in examples["audio"]]
+    inputs = feature_extractor(
+        audio_arrays, 
+        sampling_rate=16000, 
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length", # Pad to 30s usually, but for speed we rely on extractor defaults
+        max_length=int(MAX_DURATION * 16000) 
+    )
+    return inputs
+
+encoded_dataset = dataset.map(preprocess_function, batched=True, remove_columns=["audio", "file"])
+
+# 3. DEFINE CUSTOM MODEL
+# ---------------------------------------------------------
+class WhisperForAudioClassification(nn.Module):
+    def __init__(self, num_labels):
+        super().__init__()
+        # Load Base Whisper (Encoder + Decoder)
+        self.whisper = WhisperModel.from_pretrained(MODEL_CHECKPOINT)
+        
+        # We only need the Encoder for classification
+        self.encoder = self.whisper.encoder
+        
+        # FREEZE the encoder to prevent destroying pretrained features
+        # (Optional: Unfreeze later for better performance)
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+            
+        # Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.whisper.config.d_model, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_labels)
+        )
+
+    def forward(self, input_features, labels=None):
+        # input_features shape: [Batch, 80, 3000]
+        outputs = self.encoder(input_features)
+        
+        # Mean pooling: Average over the time dimension
+        # outputs.last_hidden_state shape: [Batch, Time, Dim]
+        pooled_output = outputs.last_hidden_state.mean(dim=1)
+        
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels.long())
+            
+        return (loss, logits) if loss is not None else logits
+
+model = WhisperForAudioClassification(num_labels=num_labels)
+
+# 4. METRICS
+# ---------------------------------------------------------
+metric = evaluate.load("accuracy")
+
+def compute_metrics(eval_pred):
+    predictions = np.argmax(eval_pred.predictions, axis=1)
+    return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+
+# 5. TRAINING
+# ---------------------------------------------------------
+# We need a custom data collator to handle the specific input format
+def data_collator(features):
+    input_features = torch.stack([torch.tensor(f["input_features"][0]) for f in features])
+    labels = torch.tensor([f["label"] for f in features])
+    return {"input_features": input_features, "labels": labels}
+
+training_args = TrainingArguments(
+    output_dir="./whisper_classifier",
+    per_device_train_batch_size=batch_size,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    num_train_epochs=3,
+    learning_rate=1e-4,
+    remove_unused_columns=False, # Important for custom models
+    logging_steps=10,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=encoded_dataset["train"],
+    eval_dataset=encoded_dataset["validation"],
+    compute_metrics=compute_metrics,
+    data_collator=data_collator,
+)
+
+print("Starting training...")
+trainer.train()
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+from datasets import load_dataset, Audio
+from transformers import (
+    WhisperProcessor, 
+    WhisperForConditionalGeneration, 
+    Seq2SeqTrainingArguments, 
+    Seq2SeqTrainer
+)
+import evaluate
+
+# --- CONFIGURATION ---
+MODEL_ID = "openai/whisper-tiny"
+OUT_DIR = "./whisper-finetuned-stt"
+# We use a tiny slice of Common Voice 11 (Lithuanian used as example of low-resource lang)
+# You can change 'lt' to 'en', 'hi', etc.
+DATASET_ID = "mozilla-foundation/common_voice_11_0" 
+LANGUAGE = "lt" 
+TASK = "transcribe"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# 1. LOAD DATASET & PROCESSOR
+# ------------------------------------------------------------------
+print("Loading dataset and processor...")
+processor = WhisperProcessor.from_pretrained(MODEL_ID, language=LANGUAGE, task=TASK)
+
+# Load streaming=True to avoid downloading 100GB. We take a small sample.
+common_voice = load_dataset(DATASET_ID, LANGUAGE, split="train", streaming=True)
+common_voice = common_voice.cast_column("audio", Audio(sampling_rate=16000))
+
+# Take 200 samples for training, 50 for validation
+train_dataset = list(common_voice.take(200))
+eval_dataset = list(common_voice.skip(200).take(50))
+
+# Convert list back to HuggingFace Dataset object for easier mapping
+from datasets import Dataset
+train_dataset = Dataset.from_list(train_dataset)
+eval_dataset = Dataset.from_list(eval_dataset)
+
+# 2. PREPROCESSING
+# ------------------------------------------------------------------
+def prepare_dataset(batch):
+    # Process Audio
+    audio = batch["audio"]
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+
+    # Process Text
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+print("Preprocessing data...")
+train_dataset = train_dataset.map(prepare_dataset, remove_columns=train_dataset.column_names)
+eval_dataset = eval_dataset.map(prepare_dataset, remove_columns=eval_dataset.column_names)
+
+# 3. DATA COLLATOR (Handles Padding dynamically)
+# ------------------------------------------------------------------
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # Treat inputs and labels differently for padding
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        # replace padding with -100 to ignore loss correctly
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # if bos token is appended in previous step, cut it (whisper adds it automatically)
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+# 4. METRICS (Word Error Rate)
+# ------------------------------------------------------------------
+metric = evaluate.load("wer")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    # replace -100 with pad_token_id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    # Decode
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+# 5. MODEL & TRAINING
+# ------------------------------------------------------------------
+model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID)
+model.config.forced_decoder_ids = None
+model.config.suppress_tokens = []
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir=OUT_DIR,
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=2,
+    learning_rate=1e-5,
+    warmup_steps=50,
+    max_steps=200, # Short run for demo
+    gradient_checkpointing=True,
+    fp16=True if torch.cuda.is_available() else False,
+    evaluation_strategy="steps",
+    per_device_eval_batch_size=8,
+    predict_with_generate=True,
+    generation_max_length=225,
+    save_steps=100,
+    eval_steps=100,
+    logging_steps=25,
+    report_to=["none"], # Disable wandb for this demo
+    load_best_model_at_end=True,
+    metric_for_best_model="wer",
+    greater_is_better=False,
+)
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor.feature_extractor,
+)
+
+print("Starting training...")
+trainer.train()
+
+print(f"Training finished. Model saved to {OUT_DIR}")
+import torch
+from datasets import load_dataset, Audio
+from transformers import (
+    SpeechT5Processor, 
+    SpeechT5ForTextToSpeech, 
+    SpeechT5HifiGan,
+    Seq2SeqTrainingArguments, 
+    Seq2SeqTrainer
+)
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+# --- CONFIGURATION ---
+MODEL_ID = "microsoft/speecht5_tts"
+VOCODER_ID = "microsoft/speecht5_hifigan" # Needed to listen to results
+OUT_DIR = "./speecht5-finetuned-tts"
+dataset_id = "lj_speech"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 1. LOAD DATASET & PROCESSOR
+# ------------------------------------------------------------------
+print("Loading Processor and Model...")
+processor = SpeechT5Processor.from_pretrained(MODEL_ID)
+
+print("Loading LJ Speech dataset (taking small subset)...")
+# Taking 200 examples for speed
+dataset = load_dataset(dataset_id, split="train[:200]") 
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
+# 2. CREATE SPEAKER EMBEDDINGS (X-Vectors)
+# ------------------------------------------------------------------
+# SpeechT5 is a multi-speaker model. Even for single speaker fine-tuning, 
+# we need to pass a speaker embedding. We will use a default one.
+# Normally you extract this from the audio using 'speechbrain', but we will
+# fetch a pre-calculated one to keep this script simple.
+from datasets import load_dataset as ld_xvector
+embeddings_ds = ld_xvector("Matthijs/cmu-arctic-xvectors", split="validation")
+speaker_embedding = torch.tensor(embeddings_ds[0]["xvector"]).unsqueeze(0)
+
+# 3. PREPROCESSING
+# ------------------------------------------------------------------
+def prepare_dataset(example):
+    # 1. Process Text
+    example["input_ids"] = processor(text=example["text"]).input_ids
+    
+    # 2. Process Audio (Target)
+    audio = example["audio"]
+    # The model expects Mel Spectrograms as targets, not raw waveforms
+    example["labels"] = processor(
+        audio=audio["array"], 
+        sampling_rate=audio["sampling_rate"]
+    ).audio_values
+    
+    return example
+
+print("Preprocessing dataset...")
+dataset = dataset.map(prepare_dataset, remove_columns=["audio", "text", "normalized_text", "id"])
+# Train/Test Split
+dataset = dataset.train_test_split(test_size=0.1)
+
+# 4. DATA COLLATOR
+# ------------------------------------------------------------------
+@dataclass
+class TTSDataCollatorWithPadding:
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_ids = [{"input_ids": feature["input_ids"]} for feature in features]
+        label_features = [{"input_values": feature["labels"]} for feature in features]
+        
+        # Pad Text Inputs
+        batch = self.processor.tokenizer.pad(input_ids, return_tensors="pt")
+        
+        # Pad Audio Targets (Spectrograms)
+        labels_batch = self.processor.feature_extractor.pad(label_features, return_tensors="pt")
+        
+        # Reshape labels to correct format
+        labels = labels_batch["input_values"]
+        labels_mask = labels_batch.attention_mask
+        
+        # Replace padding with -100 for loss calculation
+        labels = labels.masked_fill(labels_mask.unsqueeze(-1).ne(1), -100)
+        
+        batch["labels"] = labels
+        return batch
+
+data_collator = TTSDataCollatorWithPadding(processor=processor)
+
+# 5. LOAD MODEL
+# ------------------------------------------------------------------
+model = SpeechT5ForTextToSpeech.from_pretrained(MODEL_ID)
+
+# Disable "use_cache" during training
+model.config.use_cache = False 
+
+# 6. TRAINING
+# ------------------------------------------------------------------
+training_args = Seq2SeqTrainingArguments(
+    output_dir=OUT_DIR,
+    per_device_train_batch_size=8, # reduced for GPU mem
+    gradient_accumulation_steps=2,
+    learning_rate=1e-5,
+    warmup_steps=50,
+    max_steps=300,
+    gradient_checkpointing=True,
+    fp16=True if torch.cuda.is_available() else False,
+    evaluation_strategy="steps",
+    save_steps=100,
+    eval_steps=100,
+    logging_steps=25,
+    report_to=["none"],
+    load_best_model_at_end=True,
+)
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
+    data_collator=data_collator,
+    tokenizer=processor.tokenizer,
+)
+
+print("Starting TTS training...")
+trainer.train()
+
+# 7. INFERENCE TEST (Generate Audio)
+# ------------------------------------------------------------------
+print("Generating test audio...")
+model.eval()
+model.to(device)
+
+text = "This is a test of the fine tuned text to speech model."
+inputs = processor(text=text, return_tensors="pt").to(device)
+
+# Load Vocoder (converts spectrogram -> sound)
+vocoder = SpeechT5HifiGan.from_pretrained(VOCODER_ID).to(device)
+
+with torch.no_grad():
+    spectrogram = model.generate_speech(
+        inputs["input_ids"], 
+        speaker_embeddings=speaker_embedding.to(device)
+    )
+    # Convert spectrogram to waveform using Vocoder
+    speech = vocoder(spectrogram)
+
+# Save to file
+import soundfile as sf
+sf.write("tts_result.wav", speech.cpu().numpy(), samplerate=16000)
+print("Saved output to tts_result.wav")
