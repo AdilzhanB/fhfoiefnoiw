@@ -734,3 +734,330 @@ def back_translation(text, src_lang='en', tgt_lang='fr'):
     final_text = tokenizer_back.decode(back_translated[0], skip_special_tokens=True)
     
     return final_text
+import os
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments
+)
+import evaluate
+
+# =========================
+# CONFIG
+# =========================
+MODEL_NAME = "google/flan-t5-base"   # change to large if GPU allows
+MAX_SOURCE_LEN = 128
+MAX_TARGET_LEN = 128
+BATCH_SIZE = 16
+LR = 2e-5
+EPOCHS = 5
+OUTPUT_DIR = "./grammar_corrector"
+
+# =========================
+# LOAD DATASET
+# =========================
+# Dataset must contain columns: "sentence", "corrected"
+dataset = load_dataset(
+    "csv",
+    data_files={
+        "train": "train.csv",
+        "validation": "val.csv"
+    }
+)
+
+# =========================
+# TOKENIZER & MODEL
+# =========================
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+
+# =========================
+# PREPROCESS FUNCTION
+# =========================
+def preprocess(batch):
+    inputs = [
+        f"Fix grammar: {s}"
+        for s in batch["sentence"]
+    ]
+
+    model_inputs = tokenizer(
+        inputs,
+        max_length=MAX_SOURCE_LEN,
+        truncation=True,
+        padding="max_length"
+    )
+
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(
+            batch["corrected"],
+            max_length=MAX_TARGET_LEN,
+            truncation=True,
+            padding="max_length"
+        )
+
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+tokenized_ds = dataset.map(
+    preprocess,
+    batched=True,
+    remove_columns=dataset["train"].column_names
+)
+
+# =========================
+# METRICS (GLEU)
+# =========================
+gleu = evaluate.load("google_bleu")
+
+def compute_metrics(eval_preds):
+    preds, labels = eval_preds
+
+    decoded_preds = tokenizer.batch_decode(
+        preds, skip_special_tokens=True
+    )
+
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(
+        labels, skip_special_tokens=True
+    )
+
+    return {
+        "gleu": gleu.compute(
+            predictions=decoded_preds,
+            references=[[l] for l in decoded_labels]
+        )["google_bleu"]
+    }
+
+# =========================
+# TRAINING ARGS
+# =========================
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=LR,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=2,
+    num_train_epochs=EPOCHS,
+    fp16=torch.cuda.is_available(),
+    logging_steps=100,
+    save_total_limit=2,
+    load_best_model_at_end=True,
+    report_to="none"
+)
+
+# =========================
+# TRAINER
+# =========================
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_ds["train"],
+    eval_dataset=tokenized_ds["validation"],
+    tokenizer=tokenizer,
+    data_collator=DataCollatorForSeq2Seq(tokenizer, model),
+    compute_metrics=compute_metrics
+)
+
+# =========================
+# TRAIN
+# =========================
+trainer.train()
+
+# =========================
+# SAVE FINAL MODEL
+# =========================
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+
+print("✅ Training completed and model saved.")
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
+    Trainer,
+    TrainingArguments
+)
+from datasets import load_dataset
+
+MODEL_ID = "deepset/roberta-large-squad2"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_LEN = 384
+STRIDE = 128
+
+def prepare_features(examples, tokenizer):
+    questions = [q.strip() for q in examples["question"]]
+    tokenized = tokenizer(
+        questions,
+        examples["context"],
+        truncation="only_second",
+        max_length=MAX_LEN,
+        stride=STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    sample_mapping = tokenized.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized["offset_mapping"]
+
+    start_positions = []
+    end_positions = []
+
+    for i, offsets in enumerate(offset_mapping):
+        cls_index = tokenized["input_ids"][i].index(tokenizer.cls_token_id)
+        sample_idx = sample_mapping[i]
+        answer = examples["answers"][sample_idx]
+
+        if len(answer["answer_start"]) == 0:
+            start_positions.append(cls_index)
+            end_positions.append(cls_index)
+            continue
+
+        start_char = answer["answer_start"][0]
+        end_char = start_char + len(answer["text"][0])
+
+        sequence_ids = tokenized.sequence_ids(i)
+
+        token_start, token_end = 0, len(sequence_ids) - 1
+        while sequence_ids[token_start] != 1:
+            token_start += 1
+        while sequence_ids[token_end] != 1:
+            token_end -= 1
+
+        if not (offsets[token_start][0] <= start_char and offsets[token_end][1] >= end_char):
+            start_positions.append(cls_index)
+            end_positions.append(cls_index)
+        else:
+            while token_start < len(offsets) and offsets[token_start][0] <= start_char:
+                token_start += 1
+            while offsets[token_end][1] >= end_char:
+                token_end -= 1
+
+            start_positions.append(token_start - 1)
+            end_positions.append(token_end + 1)
+
+    tokenized["start_positions"] = start_positions
+    tokenized["end_positions"] = end_positions
+    return tokenized
+
+
+def main():
+    dataset = load_dataset("squad_v2")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForQuestionAnswering.from_pretrained(MODEL_ID).to(DEVICE)
+
+    tokenized_ds = dataset.map(
+        lambda x: prepare_features(x, tokenizer),
+        batched=True,
+        remove_columns=dataset["train"].column_names
+    )
+
+    args = TrainingArguments(
+        output_dir="./qa_model",
+        evaluation_strategy="steps",
+        learning_rate=2e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=2,
+        weight_decay=0.01,
+        fp16=torch.cuda.is_available(),
+        logging_steps=100,
+        save_steps=500,
+        report_to="none"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=tokenized_ds["train"],
+        eval_dataset=tokenized_ds["validation"],
+        tokenizer=tokenizer,
+    )
+
+    trainer.train()
+    trainer.save_model("./qa_model")
+
+
+if __name__ == "__main__":
+    main()
+import torch
+from PIL import Image
+from transformers import (
+    ViltProcessor,
+    ViltForQuestionAnswering,
+    Trainer,
+    TrainingArguments
+)
+from datasets import load_dataset
+
+MODEL_ID = "dandelin/vilt-b32-finetuned-vqa"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+def preprocess(example, processor):
+    image = Image.open(example["image"]).convert("RGB")
+    encoding = processor(
+        image,
+        example["question"],
+        truncation=True,
+        padding="max_length",
+        return_tensors="pt"
+    )
+
+    encoding = {k: v.squeeze() for k, v in encoding.items()}
+    encoding["labels"] = torch.tensor(example["label"])
+    return encoding
+
+
+def main():
+    dataset = load_dataset("vqa", "vqa2")
+
+    processor = ViltProcessor.from_pretrained(MODEL_ID)
+    model = ViltForQuestionAnswering.from_pretrained(MODEL_ID).to(DEVICE)
+
+    processed_ds = dataset.map(
+        lambda x: preprocess(x, processor),
+        remove_columns=dataset["train"].column_names
+    )
+
+    args = TrainingArguments(
+        output_dir="./vqa_model",
+        learning_rate=3e-5,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=3,
+        fp16=torch.cuda.is_available(),
+        evaluation_strategy="steps",
+        save_steps=500,
+        logging_steps=100,
+        report_to="none"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=processed_ds["train"],
+        eval_dataset=processed_ds["validation"],
+        tokenizer=processor,
+    )
+
+    trainer.train()
+    trainer.save_model("./vqa_model")
+
+
+if __name__ == "__main__":
+    main()
+from transformers import pipeline
+from PIL import Image
+
+vqa = pipeline("visual-question-answering", model="./vqa_model", device=0)
+
+img = Image.open("image.jpg").convert("RGB")
+vqa(image=img, question="How many people are in the picture?")
