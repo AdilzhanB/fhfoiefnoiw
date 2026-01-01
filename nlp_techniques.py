@@ -1145,3 +1145,84 @@ with torch.no_grad():
 submission_df = pd.DataFrame(results)
 submission_df.to_csv(SUBMISSION_FILE, index=False)
 print(f"\nInference Complete! File saved as {SUBMISSION_FILE}")
+import torch
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+from transformers import AutoProcessor, AutoModelForCausalLM
+
+# 1. Setup
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_ID = "microsoft/Florence-2-large" 
+TEST_CSV = "test.csv"
+SUBMISSION_FILE = "submission.csv"
+
+print(f"Loading Florence-2 on {DEVICE}...")
+
+# Load model with specific fixes for the errors you encountered
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID, 
+    trust_remote_code=True, 
+    torch_dtype=torch.float16 if "cuda" in DEVICE else torch.float32,
+    attn_implementation="eager" # Fix for the _supports_sdpa error
+).to(DEVICE).eval()
+
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+def count_santas(image_path):
+    try:
+        image = Image.open(image_path).convert("RGB")
+        
+        # We use grounding to find every instance of "santa claus"
+        prompt = "<CAPTION_TO_PHRASE_GROUNDING> santa claus"
+
+        inputs = processor(text=prompt, images=image, return_tensors="pt").to(DEVICE)
+        
+        # Ensure inputs are in float16 if using GPU
+        if "cuda" in DEVICE:
+            inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+
+        with torch.no_grad():
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3,
+                use_cache=False  # FIX: Prevents the 'NoneType' object has no attribute 'shape' error
+            )
+
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        
+        parsed_answer = processor.post_process_generation(
+            generated_text, 
+            task="<CAPTION_TO_PHRASE_GROUNDING>", 
+            image_size=(image.width, image.height)
+        )
+
+        # Count the bounding boxes returned for the phrase
+        results = parsed_answer.get("<CAPTION_TO_PHRASE_GROUNDING>", {})
+        bboxes = results.get('bboxes', [])
+        
+        return len(bboxes)
+
+    except Exception as e:
+        print(f"Error processing {image_path}: {e}")
+        return 0
+
+# 2. Execution Loop
+df_test = pd.read_csv(TEST_CSV)
+results = []
+
+print("Running Inference...")
+for _, row in tqdm(df_test.iterrows(), total=len(df_test)):
+    img_path = row['image_path']
+    count = count_santas(img_path)
+    results.append({
+        "image_path": img_path, 
+        "number": count
+    })
+
+# 3. Save results
+submission_df = pd.DataFrame(results)
+submission_df.to_csv(SUBMISSION_FILE, index=False)
+print(f"\nSuccess! Predictions saved to {SUBMISSION_FILE}")
