@@ -1061,3 +1061,87 @@ vqa = pipeline("visual-question-answering", model="./vqa_model", device=0)
 
 img = Image.open("image.jpg").convert("RGB")
 vqa(image=img, question="How many people are in the picture?")
+import torch
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+from transformers import BlipProcessor, BlipForQuestionAnswering
+
+# ---------------------------------------------------------
+# 1. Configuration
+# ---------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_ID = "Salesforce/blip-vqa-base"  # or "Salesforce/blip-vqa-capfilt-large" for higher accuracy
+TEST_CSV = "test.csv"
+SUBMISSION_FILE = "submission.csv"
+QUESTION = "How many Santa Clauses are in this image?"
+
+# Dictionary to handle word-to-number conversion if the model answers in text
+WORD_TO_NUM = {
+    "zero": 0, "none": 0, "one": 1, "two": 2, "three": 3, "four": 4, 
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+}
+
+# ---------------------------------------------------------
+# 2. Initialization
+# ---------------------------------------------------------
+print(f"Loading model {MODEL_ID} to {DEVICE}...")
+processor = BlipProcessor.from_pretrained(MODEL_ID)
+model = BlipForQuestionAnswering.from_pretrained(MODEL_ID).to(DEVICE)
+
+def parse_vqa_answer(answer):
+    """Extracts a natural number from the VQA text response."""
+    answer = answer.lower().strip()
+    # Check if answer is a direct digit
+    if answer.isdigit():
+        return int(answer)
+    # Check word dictionary
+    if answer in WORD_TO_NUM:
+        return WORD_TO_NUM[answer]
+    # Fallback: Extract first digit found in string
+    import re
+    digits = re.findall(r'\d+', answer)
+    return int(digits[0]) if digits else 0
+
+# ---------------------------------------------------------
+# 3. Inference Loop
+# ---------------------------------------------------------
+df_test = pd.read_csv(TEST_CSV)
+results = []
+
+print("Starting VQA Inference...")
+model.eval()
+
+with torch.no_grad():
+    for _, row in tqdm(df_test.iterrows(), total=len(df_test)):
+        img_path = row['image_path']
+        
+        try:
+            # Load and process image
+            image = Image.open(img_path).convert("RGB")
+            
+            # Prepare inputs for the Transformer
+            inputs = processor(image, QUESTION, return_tensors="pt").to(DEVICE)
+            
+            # Generate Answer
+            outputs = model.generate(**inputs, max_new_tokens=20)
+            answer_text = processor.decode(outputs[0], skip_special_tokens=True)
+            
+            # Convert text to number
+            count = parse_vqa_answer(answer_text)
+            
+            results.append({
+                "image_path": img_path,
+                "number": count
+            })
+            
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+            results.append({"image_path": img_path, "number": 0})
+
+# ---------------------------------------------------------
+# 4. Save Results
+# ---------------------------------------------------------
+submission_df = pd.DataFrame(results)
+submission_df.to_csv(SUBMISSION_FILE, index=False)
+print(f"\nInference Complete! File saved as {SUBMISSION_FILE}")
