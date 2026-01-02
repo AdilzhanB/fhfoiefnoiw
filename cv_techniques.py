@@ -2128,3 +2128,57 @@ submission = pd.DataFrame({
 submission.to_csv(SUBMISSION_FILE, index=False)
 print(f"Submission saved to {SUBMISSION_FILE}")
 print(submission.head())
+import segmentation_models_pytorch as smp
+
+model = smp.UnetPlusPlus(
+    encoder_name="efficientnet-b4", 
+    encoder_weights="imagenet",     # Pre-trained on ImageNet
+    in_channels=3,                  # RGB
+    classes=1,                      # Binary (e.g., mask vs background)
+)
+# Note: Ensure 'timm' library is installed for PVT encoders
+model = smp.MAnet(
+    encoder_name="pvt_v2_b2", 
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1,
+)
+# Pair: MAnet + pvt_v2_b2 (Transformer Encoder)
+# Why: MAnet uses Multi-scale Attention to capture global dependencies. Pairing it with a Pyramid Vision Transformer (PVT) allows the model to "see" long-range relationships in tissues or cells better than standard CNNs.
+# Best for: Cell nuclei, tiny tumors, or subtle defects in manufacturing.
+model = smp.DeepLabV3Plus(
+    encoder_name="resnet101", 
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1, 
+)
+# The "Cityscape/Scene Master" (Global Context)
+# Pair: DeepLabV3Plus + resnet101
+# Why: DeepLabV3+ uses Atrous (dilated) convolutions. It’s designed to understand "where things are" relative to each other. ResNet101 provides the depth needed to understand complex urban environments.
+# Best for: Self-driving datasets, urban planning (buildings, roads, sidewalks), and large-scale scene parsing.
+model = smp.FPN(
+    encoder_name="resnext50_32x4d", 
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1,
+)
+# The "Multi-Scale Speedster" (Object Variation)
+# Pair: FPN + resnext50_32x4d
+# Why: FPN (Feature Pyramid Network) is natively designed to handle objects of wildly different sizes. ResNext is more efficient than ResNet due to "grouped convolutions," making it fast for large image inputs (e.g., 1024x1024).
+# Best for: Satellite imagery (detecting both huge forests and tiny ships), or X-ray scans with varying fracture sizes.
+model = smp.PAN(
+    encoder_name="mit_b3", 
+    encoder_weights="imagenet",
+    in_channels=3,
+    classes=1,
+)
+# The "High-Resolution Transformer" (SOTA)
+# Pair: PAN + mit_b3 (SegFormer Encoder)
+# Why: PAN (Pyramid Attention Network) is lightweight but powerful. mit_b3 (Mix Transformer) is the backbone of SegFormer. This combination is currently top-tier for performance-to-parameters ratio.
+# Best for: High-resolution images where you want Transformer performance without the massive VRAM cost of a full ViT.
+# If your data is...	Use this Architecture	Use this Encoder
+# Very small objects	UnetPlusPlus	efficientnet-b5
+# Large landscapes	DeepLabV3Plus	resnet50 / resnet101
+# Multi-scale objects	FPN	resnext50
+# Textured/Noisy	MAnet	se_resnet50 (Squeeze-and-Excitation)
+# Limited VRAM	Unet	efficientnet-b0 / mobilenet_v2
