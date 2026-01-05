@@ -663,3 +663,99 @@ def quick_ml_workflow(X_train, y_train, X_test, y_test,
     save_pipeline(pipeline, 'trained_pipeline.pkl')
     
     return pipeline, predictions
+import lightgbm as lgb
+
+# Parameters for Competition
+lgb_params = {
+    'objective': 'multiclass', # or 'binary' or 'regression'
+    'num_class': 3,            # remove if binary/regression
+    'metric': 'multi_logloss',
+    'boosting_type': 'gbdt',
+    'learning_rate': 0.05,
+    'num_leaves': 31,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.7,
+    'bagging_freq': 5,
+    'n_jobs': -1,
+    'random_state': 42,
+    'verbose': -1
+}
+
+# Training with Early Stopping (The modern way)
+clf = lgb.LGBMClassifier(**lgb_params, n_estimators=1000)
+clf.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=100)]
+)
+
+# Feature Importance
+importance = pd.DataFrame({'feature': X.columns, 'importance': clf.feature_importances_}).sort_values('importance', ascending=False)
+from catboost import CatBoostClassifier, Pool
+
+# Identify categorical indices
+cat_features = list(range(len(X.columns[X.dtypes == 'category']))) 
+# or use column names if X is a DataFrame
+cat_features = X.select_dtypes(include=['category', 'object']).columns.tolist()
+
+model = CatBoostClassifier(
+    iterations=1000,
+    learning_rate=0.03,
+    depth=6,
+    l2_leaf_reg=3,
+    loss_function='MultiClass', # or 'Logloss' or 'RMSE'
+    eval_metric='Accuracy',
+    random_seed=42,
+    verbose=100
+)
+
+model.fit(
+    X_train, y_train,
+    cat_features=cat_features,
+    eval_set=(X_val, y_val),
+    early_stopping_rounds=50,
+    use_best_model=True
+)
+import xgboost as xgb
+
+clf = xgb.XGBClassifier(
+    n_estimators=1000,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    tree_method='hist',      # Fast histogram optimized
+    enable_categorical=True, # MUST be True if using categorical dtypes
+    device="cuda",           # Use "cpu" if no GPU available
+    random_state=42
+)
+
+clf.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    early_stopping_rounds=50,
+    verbose=100
+)
+import optuna
+
+def objective(trial):
+    param = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'verbosity': -1,
+        'boosting_type': 'gbdt',
+        'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 2, 256),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.4, 1.0),
+    }
+    
+    # Simple split for speed inside Optuna
+    X_t, X_v, y_t, y_v = train_test_split(X, y, test_size=0.2)
+    gbm = lgb.LGBMClassifier(**param)
+    gbm.fit(X_t, y_t, eval_set=[(X_v, y_v)], callbacks=[lgb.early_stopping(50)])
+    preds = gbm.predict(X_v)
+    return f1_score(y_v, preds)
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=50)
+print(study.best_params)
