@@ -759,3 +759,112 @@ def objective(trial):
 study = optuna.create_study(direction='maximize')
 study.optimize(objective, n_trials=50)
 print(study.best_params)
+import pandas as pd
+import numpy as np
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
+from catboost import CatBoostClassifier
+from scipy.optimize import linear_sum_assignment
+from collections import Counter
+
+# 1. ЗАГРУЗКА
+train123 = pd.read_csv('train_class123.csv')
+train45 = pd.read_csv('train_class45.csv')
+test = pd.read_csv('test.csv')
+
+features = [c for c in train123.columns if 'feat' in c]
+
+# Объединяем всё для общего пространства
+all_features = pd.concat([train123[features], train45[features], test[features]], axis=0)
+scaler = StandardScaler()
+X_all_scaled = scaler.fit_transform(all_features)
+
+# 2. ГЕОМЕТРИЧЕСКИЙ АНАЛИЗ (GMM)
+# Используем GMM не только для меток, но и как мощные фичи
+print("Извлечение геометрических признаков...")
+gmm = GaussianMixture(n_components=5, covariance_type='full', random_state=42, n_init=10)
+gmm.fit(X_all_scaled)
+
+clusters_all = gmm.predict(X_all_scaled)
+probs_all = gmm.predict_proba(X_all_scaled)
+
+# 3. ИДЕАЛЬНЫЙ МАППИНГ (Hungarian Algorithm)
+# Определяем, какой кластер какой теме соответствует
+clusters_123 = clusters_all[:len(train123)]
+clusters_45 = clusters_all[len(train123):len(train123)+len(train45)]
+
+cost_matrix = np.zeros((5, 5))
+for c_id in range(5):
+    # Считаем голоса из чистого датасета (4-5) и грязного (1-3)
+    labels = list(train45['label'].values[clusters_45 == c_id]) + \
+             list(train123['label'].values[clusters_123 == c_id])
+    counts = Counter(labels)
+    for t_idx, theme in enumerate([1, 2, 3, 4, 5]):
+        cost_matrix[c_id, t_idx] = -counts.get(theme, 0)
+
+row_ind, col_ind = linear_sum_assignment(cost_matrix)
+cluster_to_label = {row: (col + 1) for row, col in zip(row_ind, col_ind)}
+print("Карта тем:", cluster_to_label)
+
+# 4. ПОДГОТОВКА ДАННЫХ С ВЕСАМИ
+# Переразмечаем train123 через GMM
+train123_fixed_labels = np.array([cluster_to_label[c] for c in clusters_123])
+
+# Собираем признаки: оригиналы + вероятности кластеров
+X_train_final = np.hstack([
+    np.vstack([train123[features].values, train45[features].values]),
+    probs_all[:len(train123)+len(train45)]
+])
+
+y_train_final = np.concatenate([train123_fixed_labels, train45['label'].values])
+
+# ВАЖНО: Даем train45 больший вес, так как это истина
+weights = np.ones(len(y_train_final))
+weights[len(train123):] = 5.0 # Вес 5.0 для чистых данных
+
+# 5. ОБУЧЕНИЕ МОЩНОГО АНСАМБЛЯ
+print("Обучение финальной модели...")
+model = CatBoostClassifier(
+    iterations=4000,
+    learning_rate=0.02,
+    depth=7,
+    l2_leaf_reg=10,
+    loss_function='MultiClass',
+    early_stopping_rounds=200,
+    random_seed=42,
+    verbose=500
+)
+
+model.fit(X_train_final, y_train_final, sample_weight=weights)
+
+# 6. PSEUDO-LABELING (Для последних +5-10 баллов)
+# Предсказываем тест
+X_test_meta = np.hstack([
+    test[features].values,
+    probs_all[-len(test):]
+])
+test_probs = model.predict_proba(X_test_meta)
+test_labels = np.argmax(test_probs, axis=1) + 1
+test_conf = np.max(test_probs, axis=1)
+
+# Берем только те образцы из теста, в которых модель уверена на 98%+
+mask = test_conf > 0.98
+X_pseudo = X_test_meta[mask]
+y_pseudo = test_labels[mask]
+
+if len(y_pseudo) > 0:
+    print(f"Добавляем {len(y_pseudo)} уверенных примеров из теста в обучение...")
+    X_ultra = np.vstack([X_train_final, X_pseudo])
+    y_ultra = np.concatenate([y_train_final, y_pseudo])
+    weights_ultra = np.concatenate([weights, np.ones(len(y_pseudo))])
+    
+    # Переобучаем на расширенном сете
+    model.fit(X_ultra, y_ultra, sample_weight=weights_ultra)
+
+# 7. ФИНАЛЬНЫЙ РЕЗУЛЬТАТ
+final_preds = model.predict(X_test_meta).flatten()
+
+submission = pd.DataFrame({
+    'id': test['id'],
+    'label': final_preds.astype(int)
+})
