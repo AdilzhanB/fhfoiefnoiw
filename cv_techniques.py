@@ -2182,3 +2182,546 @@ model = smp.PAN(
 # Multi-scale objects	FPN	resnext50
 # Textured/Noisy	MAnet	se_resnet50 (Squeeze-and-Excitation)
 # Limited VRAM	Unet	efficientnet-b0 / mobilenet_v2
+"""
+Hogspell Challenge: Complete Solution
+Transforms horses to pigs in Stable Diffusion generated images
+Author: AdilzhanB
+Date: 2025-08-18
+"""
+
+import os
+import json
+import random
+import hashlib
+import pathlib
+import warnings
+from datetime import datetime
+from io import BytesIO
+from typing import Dict, List, Tuple, Optional
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+from PIL import Image
+import base64
+
+from diffusers import StableDiffusionPipeline
+from transformers import CLIPProcessor, CLIPModel
+from torchvision import transforms
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+
+# Configuration
+CONFIG = {
+    'seed': 12782637,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'model_name': 'runwayml/stable-diffusion-v1-5',
+    'clip_model_name': 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+    'output_dir': './hogspell_output',
+    'model_dir': './hogspell_model',
+    'batch_size': 8,
+    'num_inference_steps': 50,
+    'guidance_scale': 7.5,
+    'learning_rate': 1e-5,
+    'weight_decay': 1e-4,
+    'num_epochs': 3,
+    'image_size': 512,
+}
+
+def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"Seed {seed} set for reproducibility")
+
+def image_to_base64(image: Image.Image, fmt: str = "PNG") -> str:
+    """Convert PIL Image to base64 string"""
+    buf = BytesIO()
+    image.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def base64_to_image(base64_str: str) -> Image.Image:
+    """Convert base64 string to PIL Image"""
+    img_data = base64.b64decode(base64_str)
+    img = Image.open(BytesIO(img_data))
+    return img
+
+class HogspellDataset:
+    """Dataset preparation for Hogspell Challenge"""
+    
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def get_training_prompts(self) -> Dict[str, List[str]]:
+        """Generate comprehensive training prompts"""
+        
+        # Base pig prompts with various styles
+        pig_prompts = [
+            "realistic photo of a pig",
+            "watercolor painting of a pig",
+            "oil painting of a pig", 
+            "3D render of a pig",
+            "cartoon pig",
+            "impressionist pig painting",
+            "pig portrait",
+            "pig in a farm",
+            "cute pig",
+            "pig eating",
+            "pig family",
+            "pig in mud",
+        ]
+        
+        # Corresponding horse prompts
+        horse_prompts = [prompt.replace("pig", "horse") for prompt in pig_prompts]
+        
+        # Edge cases that might generate horses without explicit "horse" mention
+        edge_horse_prompts = [
+            "cowboy riding his mount",
+            "knight on his steed",
+            "racing at the derby",
+            "farm animals in a stable",
+            "equestrian competition",
+            "wild mustang",
+            "mare with foal",
+            "stallion galloping",
+        ]
+        
+        # Neutral prompts (should not generate horses or pigs)
+        neutral_prompts = [
+            "mountain landscape",
+            "city skyline at sunset",
+            "ocean waves",
+            "forest in autumn",
+            "cat sitting on a chair",
+            "dog playing in park",
+            "bird flying in sky",
+            "flower garden",
+            "car on highway",
+            "abstract art",
+        ]
+        
+        return {
+            'pig': pig_prompts,
+            'horse': horse_prompts + edge_horse_prompts,
+            'neutral': neutral_prompts
+        }
+
+class HogspellTrainer:
+    """Advanced trainer for Hogspell Challenge"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.device = config['device']
+        
+        # Load models
+        self.pipe = self._load_pipeline()
+        self.clip_model, self.clip_processor = self._load_clip()
+        
+        # Image transforms
+        self.image_transforms = transforms.Compose([
+            transforms.Resize((config['image_size'], config['image_size'])),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        
+    def _load_pipeline(self) -> StableDiffusionPipeline:
+        """Load Stable Diffusion pipeline"""
+        print("Loading Stable Diffusion v1.5...")
+        pipe = StableDiffusionPipeline.from_pretrained(
+            self.config['model_name'],
+            torch_dtype=torch.float32,
+            safety_checker=None,
+        ).to(self.device)
+        return pipe
+        
+    def _load_clip(self) -> Tuple[CLIPModel, CLIPProcessor]:
+        """Load CLIP model for evaluation"""
+        print("Loading CLIP model...")
+        clip_model = CLIPModel.from_pretrained(self.config['clip_model_name']).eval().to(self.device)
+        clip_processor = CLIPProcessor.from_pretrained(self.config['clip_model_name'])
+        return clip_model, clip_processor
+    
+    def generate_training_data(self, prompts: Dict[str, List[str]]) -> Dict[str, List[Image.Image]]:
+        """Generate training images"""
+        print("Generating training data...")
+        training_images = {}
+        
+        for category, prompt_list in prompts.items():
+            if category == 'neutral':
+                continue  # Skip neutral for training data generation
+                
+            images = []
+            for i, prompt in enumerate(tqdm(prompt_list, desc=f"Generating {category} images")):
+                image = self.pipe(
+                    prompt=prompt,
+                    num_inference_steps=self.config['num_inference_steps'],
+                    guidance_scale=self.config['guidance_scale'],
+                    generator=torch.Generator(device=self.device).manual_seed(self.config['seed'] + i)
+                ).images[0]
+                images.append(image)
+                
+                # Save image
+                image_path = os.path.join(self.config['output_dir'], f"{category}_{i:03d}.png")
+                image.save(image_path)
+            
+            training_images[category] = images
+            
+        return training_images
+    
+    def compute_transformation_loss(self, horse_prompt: str, pig_image: Image.Image) -> torch.Tensor:
+        """Compute loss for horse-to-pig transformation"""
+        # Convert pig image to tensor and encode to latent space
+        pig_tensor = self.image_transforms(pig_image).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            pig_latent = self.pipe.vae.encode(pig_tensor).latent_dist.sample() * 0.18215
+        
+        # Encode horse prompt
+        with torch.no_grad():
+            text_input = self.pipe.tokenizer(
+                horse_prompt,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_embeddings = self.pipe.text_encoder(text_input.input_ids.to(self.device))[0]
+        
+        # Add noise for training
+        noise = torch.randn_like(pig_latent)
+        timesteps = torch.randint(
+            0, self.pipe.scheduler.config.num_train_timesteps, (1,), device=self.device
+        )
+        noisy_latent = self.pipe.scheduler.add_noise(pig_latent, noise, timesteps)
+        
+        # Predict noise using UNet
+        self.pipe.unet.train()
+        predicted_noise = self.pipe.unet(noisy_latent, timesteps, text_embeddings).sample
+        
+        # MSE loss
+        loss = F.mse_loss(predicted_noise, noise)
+        return loss
+    
+    def compute_neutral_regularization(self, neutral_prompts: List[str], lambda_reg: float = 0.1) -> torch.Tensor:
+        """Regularization to prevent pig generation on neutral prompts"""
+        total_loss = 0.0
+        count = 0
+        
+        for prompt in neutral_prompts[:3]:  # Use subset for efficiency
+            # Generate with current model
+            with torch.no_grad():
+                image = self.pipe(
+                    prompt=prompt,
+                    num_inference_steps=20,  # Fewer steps for regularization
+                    guidance_scale=self.config['guidance_scale'],
+                    generator=torch.Generator(device=self.device).manual_seed(self.config['seed'])
+                ).images[0]
+            
+            # Check if image contains pig using CLIP
+            inputs = self.clip_processor(
+                text=["pig", "neutral object", ""],
+                images=[image],
+                return_tensors="pt",
+                padding=True
+            ).to(self.device)
+            
+            with torch.no_grad():
+                logits = self.clip_model(**inputs).logits_per_image.squeeze(0)
+                pig_prob = F.softmax(logits, dim=0)[0]  # Probability of being a pig
+            
+            # Penalize pig probability
+            reg_loss = lambda_reg * pig_prob
+            total_loss += reg_loss
+            count += 1
+        
+        return total_loss / max(count, 1)
+    
+    def train(self, training_data: Dict[str, List[Image.Image]], prompts: Dict[str, List[str]]):
+        """Main training loop"""
+        print("Starting advanced fine-tuning...")
+        
+        # Freeze VAE and text encoder, train only UNet
+        self.pipe.vae.requires_grad_(False)
+        self.pipe.text_encoder.requires_grad_(False)
+        self.pipe.unet.requires_grad_(True)
+        
+        # Setup optimizer and scheduler
+        optimizer = AdamW(
+            self.pipe.unet.parameters(),
+            lr=self.config['learning_rate'],
+            weight_decay=self.config['weight_decay']
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=50)
+        
+        # Training loop
+        for epoch in range(self.config['num_epochs']):
+            print(f"Epoch {epoch + 1}/{self.config['num_epochs']}")
+            
+            epoch_loss = 0.0
+            batch_count = 0
+            
+            # Iterate through horse-pig pairs
+            horse_prompts = prompts['horse']
+            pig_images = training_data['pig']
+            
+            for i, (horse_prompt, pig_image) in enumerate(zip(horse_prompts, pig_images)):
+                # Primary transformation loss
+                transform_loss = self.compute_transformation_loss(horse_prompt, pig_image)
+                
+                # Regularization loss (every few iterations to save compute)
+                if i % 3 == 0:
+                    reg_loss = self.compute_neutral_regularization(prompts['neutral'])
+                else:
+                    reg_loss = torch.tensor(0.0, device=self.device)
+                
+                # Combined loss
+                total_loss = transform_loss + reg_loss
+                
+                # Backward pass
+                optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.pipe.unet.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                
+                epoch_loss += total_loss.item()
+                batch_count += 1
+                
+                if (i + 1) % 5 == 0:
+                    print(f"  Step {i+1}/{len(horse_prompts)}, Loss: {total_loss.item():.4f}")
+            
+            avg_loss = epoch_loss / batch_count
+            print(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
+        
+        # Save model
+        print("Saving fine-tuned model...")
+        os.makedirs(self.config['model_dir'], exist_ok=True)
+        self.pipe.save_pretrained(self.config['model_dir'])
+        print(f"Model saved to {self.config['model_dir']}")
+
+class HogspellEvaluator:
+    """Evaluation pipeline for Hogspell Challenge"""
+    
+    def __init__(self, pipe: StableDiffusionPipeline, clip_model: CLIPModel, clip_processor: CLIPProcessor):
+        self.pipe = pipe
+        self.clip_model = clip_model
+        self.clip_processor = clip_processor
+        self.device = pipe.device
+    
+    @torch.no_grad()
+    def evaluate_image(self, image: Image.Image, prompt_type: str, original_prompt: str = "") -> bool:
+        """Evaluate single image using CLIP"""
+        if prompt_type == 'horse':
+            classes = ["pig", "horse", ""]
+            target_class = 0  # Should predict pig
+        elif prompt_type == 'pig':
+            classes = ["pig", "horse", ""]
+            target_class = 0  # Should predict pig
+        else:  # neutral
+            classes = [original_prompt, "pig", "horse", ""]
+            target_class = 0  # Should predict original prompt or neutral
+        
+        inputs = self.clip_processor(
+            text=classes,
+            images=[image],
+            return_tensors="pt",
+            padding=True
+        ).to(self.device)
+        
+        logits = self.clip_model(**inputs).logits_per_image.squeeze(0)
+        predicted_class = logits.argmax().item()
+        
+        return predicted_class == target_class
+    
+    def validate_model(self, test_prompts: Dict[str, List[str]]) -> Tuple[float, Dict[str, float]]:
+        """Comprehensive model validation"""
+        print("Validating model performance...")
+        
+        results = {}
+        
+        for prompt_type, prompts in test_prompts.items():
+            correct = 0
+            total = len(prompts)
+            
+            for prompt in tqdm(prompts, desc=f"Evaluating {prompt_type} prompts"):
+                # Generate image
+                image = self.pipe(
+                    prompt=prompt,
+                    num_inference_steps=CONFIG['num_inference_steps'],
+                    guidance_scale=CONFIG['guidance_scale'],
+                    generator=torch.Generator(device=self.device).manual_seed(CONFIG['seed'])
+                ).images[0]
+                
+                # Evaluate
+                is_correct = self.evaluate_image(image, prompt_type, prompt)
+                if is_correct:
+                    correct += 1
+            
+            accuracy = correct / total
+            results[f'{prompt_type}_acc'] = accuracy
+            print(f"{prompt_type.capitalize()} accuracy: {accuracy:.3f}")
+        
+        # Calculate harmonic mean
+        accuracies = [results['horse_acc'], results['pig_acc'], results['neutral_acc']]
+        harmonic_mean = self._harmonic_mean(accuracies)
+        
+        print(f"Final Score (Harmonic Mean): {harmonic_mean:.3f}")
+        return harmonic_mean, results
+    
+    def _harmonic_mean(self, values: List[float]) -> float:
+        """Calculate harmonic mean"""
+        positive_values = [v for v in values if v > 0]
+        if not positive_values:
+            return 0.0
+        return len(positive_values) / sum(1 / v for v in positive_values)
+
+def generate_submission(pipe: StableDiffusionPipeline, prompts: Dict[str, str], config: Dict) -> pd.DataFrame:
+    """Generate final submission"""
+    print("Generating submission...")
+    
+    pipe.to(config['device'])
+    if pipe.safety_checker is not None:
+        pipe.safety_checker = lambda imgs, **kw: (imgs, False)
+    
+    ids, images_b64 = [], []
+    
+    # Process prompts in batches
+    prompt_items = list(prompts.items())
+    batch_size = config['batch_size']
+    
+    for i in range(0, len(prompt_items), batch_size):
+        batch_items = prompt_items[i:i+batch_size]
+        batch_prompts = [item[1] for item in batch_items]
+        batch_ids = [item[0] for item in batch_items]
+        
+        # Generate unique seeds for each prompt
+        seeds = [config['seed'] + hash(prompt_id) % 1000000 for prompt_id in batch_ids]
+        
+        with torch.autocast(device_type=str(config['device'])):
+            generated_images = []
+            for prompt, seed in zip(batch_prompts, seeds):
+                image = pipe(
+                    prompt=prompt,
+                    num_inference_steps=config['num_inference_steps'],
+                    guidance_scale=config['guidance_scale'],
+                    generator=torch.Generator(device=config['device']).manual_seed(seed)
+                ).images[0]
+                generated_images.append(image)
+        
+        # Convert to base64
+        for prompt_id, image in zip(batch_ids, generated_images):
+            ids.append(prompt_id)
+            images_b64.append(image_to_base64(image))
+        
+        print(f"Generated {i + len(batch_items)} / {len(prompt_items)}")
+    
+    return pd.DataFrame({"id": ids, "0": images_b64})
+
+def save_submission(df: pd.DataFrame):
+    """Save submission with metadata"""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    df_sha = hashlib.sha256(csv_bytes).hexdigest()
+    
+    submit_dir = pathlib.Path("submissions") / f"hogspell_{timestamp}_{df_sha[:8]}"
+    submit_dir.mkdir(parents=True, exist_ok=True)
+    
+    csv_path = submit_dir / f"submission_{df_sha[:8]}.csv"
+    csv_path.write_bytes(csv_bytes)
+    
+    # Save metadata
+    meta = {
+        "generated_at": timestamp,
+        "dataframe_sha256": df_sha,
+        "config": CONFIG,
+        "author": "AdilzhanB"
+    }
+    
+    (submit_dir / "metadata.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), 
+        encoding="utf-8"
+    )
+    
+    print(f"Submission saved: {csv_path}")
+    print(f"Metadata saved: {submit_dir / 'metadata.json'}")
+
+def main():
+    """Main execution pipeline"""
+    print("🐷 Starting Hogspell Challenge Solution 🐷")
+    print(f"Device: {CONFIG['device']}")
+    
+    # Set seed for reproducibility
+    set_seed(CONFIG['seed'])
+    
+    # Initialize components
+    dataset = HogspellDataset(CONFIG['output_dir'])
+    trainer = HogspellTrainer(CONFIG)
+    
+    # Prepare training data
+    print("\n📊 Preparing training data...")
+    training_prompts = dataset.get_training_prompts()
+    training_images = trainer.generate_training_data(training_prompts)
+    
+    # Train model
+    print("\n🎯 Training model...")
+    trainer.train(training_images, training_prompts)
+    
+    # Validate model
+    print("\n✅ Validating model...")
+    evaluator = HogspellEvaluator(trainer.pipe, trainer.clip_model, trainer.clip_processor)
+    
+    # Create validation set (subset of training prompts)
+    validation_prompts = {
+        'horse': training_prompts['horse'][:5],
+        'pig': training_prompts['pig'][:5], 
+        'neutral': training_prompts['neutral'][:5]
+    }
+    
+    score, detailed_results = evaluator.validate_model(validation_prompts)
+    
+    # Load competition prompts and generate submission
+    print("\n🚀 Generating final submission...")
+    
+    # Load prompts (assuming they're in prompts.json)
+    try:
+        with open("prompts.json", "r") as f:
+            competition_prompts = json.load(f)
+        
+        submission_df = generate_submission(trainer.pipe, competition_prompts, CONFIG)
+        save_submission(submission_df)
+        
+        print(f"\n🎉 Solution completed!")
+        print(f"Validation Score: {score:.3f}")
+        print(f"Horse->Pig Accuracy: {detailed_results['horse_acc']:.3f}")
+        print(f"Pig Preservation: {detailed_results['pig_acc']:.3f}")
+        print(f"Neutral Preservation: {detailed_results['neutral_acc']:.3f}")
+        
+    except FileNotFoundError:
+        print("⚠️  prompts.json not found. Please provide competition prompts file.")
+        print("Creating sample submission with validation prompts...")
+        
+        # Create sample prompts for demonstration
+        sample_prompts = {}
+        for i, prompt_list in enumerate([validation_prompts['horse'], validation_prompts['pig'], validation_prompts['neutral']]):
+            for j, prompt in enumerate(prompt_list):
+                sample_prompts[f"{i}_{j}"] = prompt
+        
+        submission_df = generate_submission(trainer.pipe, sample_prompts, CONFIG)
+        save_submission(submission_df)
+
+if __name__ == "__main__":
+    main()
