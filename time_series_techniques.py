@@ -780,3 +780,130 @@ def walk_forward_validation(data, initial_train_size, step_size=1):
         results.append((train, test))
     
     return results
+import torch
+from torch.utils.data import Dataset
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, df, feature_cols, input_len, horizon, target_cols=None):
+        self.feature_cols = feature_cols
+        self.target_cols = target_cols or feature_cols
+        self.input_len = input_len
+        self.horizon = horizon
+
+        data = torch.tensor(
+            df[feature_cols].values,
+            dtype=torch.float32
+        )
+
+        self.mean = data.mean(dim=0)
+        self.std = data.std(dim=0) + 1e-6
+        self.data = (data - self.mean) / self.std
+
+        self.target_idx = [
+            feature_cols.index(c) for c in self.target_cols
+        ]
+
+    def __len__(self):
+        return len(self.data) - self.input_len - self.horizon + 1
+
+    def __getitem__(self, idx):
+        x = self.data[idx:idx + self.input_len]
+        y = self.data[
+            idx + self.input_len :
+            idx + self.input_len + self.horizon,
+            self.target_idx
+        ]
+        return x, y
+import torch.nn as nn
+import torch
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.score = nn.Linear(hidden_dim, 1)
+
+    def forward(self, h):
+        """
+        h: (B, T, H)
+        """
+        weights = self.score(h).squeeze(-1)
+        weights = torch.softmax(weights, dim=1)
+        context = torch.sum(h * weights.unsqueeze(-1), dim=1)
+        return context
+class AttnLSTMForecaster(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, horizon, output_dim):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_dim, hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.3
+        )
+
+        self.attn = TemporalAttention(hidden_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, horizon * output_dim)
+        )
+
+        self.horizon = horizon
+        self.output_dim = output_dim
+
+    def forward(self, x, state=None):
+        h, state = self.lstm(x, state)
+        context = self.attn(h)
+
+        out = self.head(context)
+        out = out.view(-1, self.horizon, self.output_dim)
+        return out, state
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+class TransformerForecaster(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, horizon, output_dim):
+        super().__init__()
+
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_enc = PositionalEncoding(d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=4 * d_model,
+            dropout=0.3,
+            batch_first=True
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.head = nn.Linear(d_model, horizon * output_dim)
+        self.horizon = horizon
+        self.output_dim = output_dim
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_enc(x)
+
+        h = self.encoder(x)
+        h = h[:, -1]
+
+        out = self.head(h)
+        out = out.view(-1, self.horizon, self.output_dim)
+        return out
