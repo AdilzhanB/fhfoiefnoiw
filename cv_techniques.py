@@ -2725,3 +2725,1513 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
+Advanced YOLO Implementation in PyTorch
+---------------------------------------
+This script covers:
+1. Model Architecture (Darknet-53 backbone with Multi-scale heads)
+2. Custom YOLO Loss (Box regression + Objectness + Class probabilities)
+3. Dataset Class (Handling resizing, anchors, and grid assignment)
+4. Training Loop
+5. Inference
+
+DATASET STRUCTURE (DST) EXPLANATION:
+------------------------------------
+To train this on real data, your directory should look like this:
+
+/dataset_root/
+    ├── images/
+    │   ├── img1.jpg
+    │   ├── img2.jpg
+    │   └── ...
+    ├── labels/
+    │   ├── img1.txt
+    │   ├── img2.txt
+    │   └── ...
+    ├── train.csv (columns: img_filename, label_filename)
+    └── test.csv
+
+LABEL FORMAT (.txt files):
+--------------------------
+One row per object. Values are normalized [0, 1].
+<class_id> <center_x> <center_y> <width> <height>
+
+Example (img1.txt):
+0 0.5 0.5 0.2 0.3  (Class 0, centered, 20% width, 30% height)
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+import numpy as np
+import os
+import pandas as pd
+from PIL import Image
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# -------------------------------------------------------------------
+# 1. CONFIGURATION & ANCHORS
+# -------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 16
+IMAGE_SIZE = 416
+NUM_CLASSES = 20  # Example: Pascal VOC has 20 classes
+CONF_THRESHOLD = 0.6
+NMS_THRESHOLD = 0.5
+NUM_EPOCHS = 10
+
+# Anchors for 3 scales (calculated via K-means on COCO dataset usually)
+# Scale 1 (13x13), Scale 2 (26x26), Scale 3 (52x52)
+ANCHORS = [
+    [(0.28, 0.22), (0.38, 0.48), (0.9, 0.78)],  # Large objects
+    [(0.07, 0.15), (0.15, 0.11), (0.14, 0.29)], # Medium objects
+    [(0.02, 0.03), (0.04, 0.07), (0.08, 0.06)], # Small objects
+]
+
+# -------------------------------------------------------------------
+# 2. UTILITY FUNCTIONS (IoU, NMS)
+# -------------------------------------------------------------------
+def iou_width_height(boxes1, boxes2):
+    """Calculates IoU based on width and height (used for anchor assignment)"""
+    intersection = torch.min(boxes1[..., 0], boxes2[..., 0]) * torch.min(boxes1[..., 1], boxes2[..., 1])
+    union = (boxes1[..., 0] * boxes1[..., 1]) + (boxes2[..., 0] * boxes2[..., 1]) - intersection
+    return intersection / union
+
+def intersection_over_union(boxes_preds, boxes_labels, box_format="midpoint"):
+    """
+    Calculates IoU.
+    box_format="midpoint": (x, y, w, h)
+    box_format="corners": (x1, y1, x2, y2)
+    """
+    if box_format == "midpoint":
+        box1_x1 = boxes_preds[..., 0:1] - boxes_preds[..., 2:3] / 2
+        box1_y1 = boxes_preds[..., 1:2] - boxes_preds[..., 3:4] / 2
+        box1_x2 = boxes_preds[..., 0:1] + boxes_preds[..., 2:3] / 2
+        box1_y2 = boxes_preds[..., 1:2] + boxes_preds[..., 3:4] / 2
+        
+        box2_x1 = boxes_labels[..., 0:1] - boxes_labels[..., 2:3] / 2
+        box2_y1 = boxes_labels[..., 1:2] - boxes_labels[..., 3:4] / 2
+        box2_x2 = boxes_labels[..., 0:1] + boxes_labels[..., 2:3] / 2
+        box2_y2 = boxes_labels[..., 1:2] + boxes_labels[..., 3:4] / 2
+    
+    x1 = torch.max(box1_x1, box2_x1)
+    y1 = torch.max(box1_y1, box2_y1)
+    x2 = torch.min(box1_x2, box2_x2)
+    y2 = torch.min(box1_y2, box2_y2)
+
+    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    box1_area = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
+
+    return intersection / (box1_area + box2_area - intersection + 1e-6)
+
+def non_max_suppression(bboxes, iou_threshold, threshold, box_format="midpoint"):
+    """
+    Does Non Max Suppression given a list of bboxes.
+    bboxes: list of lists [[class_pred, prob_score, x1, y1, x2, y2], ...]
+    """
+    assert type(bboxes) == list
+    bboxes = [box for box in bboxes if box[1] > threshold]
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    bboxes_after_nms = []
+
+    while bboxes:
+        chosen_box = bboxes.pop(0)
+        bboxes_after_nms.append(chosen_box)
+        bboxes = [
+            box for box in bboxes
+            if intersection_over_union(
+                torch.tensor(chosen_box[2:]),
+                torch.tensor(box[2:]),
+                box_format=box_format,
+            ) < iou_threshold
+        ]
+    return bboxes_after_nms
+
+# -------------------------------------------------------------------
+# 3. MODEL ARCHITECTURE
+# -------------------------------------------------------------------
+class CNNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, bn_act=True, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, bias=not bn_act, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels) if bn_act else nn.Identity()
+        self.leaky = nn.LeakyReLU(0.1) if bn_act else nn.Identity()
+
+    def forward(self, x):
+        return self.leaky(self.bn(self.conv(x)))
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels, use_residual=True, num_repeats=1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for _ in range(num_repeats):
+            self.layers += [
+                nn.Sequential(
+                    CNNBlock(channels, channels // 2, kernel_size=1),
+                    CNNBlock(channels // 2, channels, kernel_size=3, padding=1),
+                )
+            ]
+        self.use_residual = use_residual
+        self.num_repeats = num_repeats
+
+    def forward(self, x):
+        for layer in self.layers:
+            if self.use_residual:
+                x = x + layer(x)
+            else:
+                x = layer(x)
+        return x
+
+class ScalePrediction(nn.Module):
+    """
+    ScalePrediction extracts the output for a specific scale (Small, Medium, or Large).
+    Output shape: [Batch, 3 (anchors), Grid, Grid, 5 + Num_Classes]
+    """
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.pred = nn.Sequential(
+            CNNBlock(in_channels, 2 * in_channels, kernel_size=3, padding=1),
+            CNNBlock(2 * in_channels, (num_classes + 5) * 3, bn_act=False, kernel_size=1),
+        )
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        return (
+            self.pred(x)
+            .reshape(x.shape[0], 3, self.num_classes + 5, x.shape[2], x.shape[3])
+            .permute(0, 1, 3, 4, 2)
+        )
+
+class YOLOv3(nn.Module):
+    def __init__(self, in_channels=3, num_classes=80):
+        super().__init__()
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.layers = self._create_conv_layers()
+
+    def forward(self, x):
+        outputs = []  # Stores outputs for the 3 scales
+        route_connections = [] # Stores skip connections
+        for layer in self.layers:
+            if isinstance(layer, ScalePrediction):
+                outputs.append(layer(x))
+                continue
+            x = layer(x)
+            if isinstance(layer, ResidualBlock) and layer.num_repeats == 8:
+                route_connections.append(x)
+            elif isinstance(layer, nn.Upsample):
+                x = torch.cat([x, route_connections[-1]], dim=1)
+                route_connections.pop()
+        return outputs
+
+    def _create_conv_layers(self):
+        layers = nn.ModuleList()
+        in_channels = self.in_channels
+        
+        # Architecture Config (Tuple=ResBlock, "S"=ScaleBranch, "U"=Upsample)
+        config = [
+            (32, 3, 1), (64, 3, 2), ["B", 1], (128, 3, 2), ["B", 2],
+            (256, 3, 2), ["B", 8], (512, 3, 2), ["B", 8], (1024, 3, 2), ["B", 4],
+            "S", # Scale 1 (13x13)
+            (512, 1, 1), "U", (256, 1, 1), "S", # Scale 2 (26x26)
+            (256, 1, 1), "U", (128, 1, 1), "S", # Scale 3 (52x52)
+        ]
+
+        for module in config:
+            if isinstance(module, tuple):
+                out_channels, kernel_size, stride = module
+                layers.append(CNNBlock(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=1 if kernel_size == 3 else 0))
+                in_channels = out_channels
+            elif isinstance(module, list):
+                num_repeats = module[1]
+                layers.append(ResidualBlock(in_channels, num_repeats=num_repeats,))
+            elif isinstance(module, str):
+                if module == "S":
+                    layers += [
+                        ResidualBlock(in_channels, use_residual=False, num_repeats=1),
+                        CNNBlock(in_channels, in_channels // 2, kernel_size=1),
+                        ScalePrediction(in_channels // 2, num_classes=self.num_classes),
+                    ]
+                    in_channels = in_channels // 2
+                elif module == "U":
+                    layers.append(nn.Upsample(scale_factor=2))
+                    in_channels = in_channels * 3 # Concatenation logic handled in forward
+        return layers
+
+# -------------------------------------------------------------------
+# 4. DATASET & PREPROCESSING
+# -------------------------------------------------------------------
+class YOLODataset(Dataset):
+    def __init__(self, csv_file, img_dir, label_dir, anchors, image_size=416, S=[13, 26, 52], C=20, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.label_dir = label_dir
+        self.image_size = image_size
+        self.transform = transform
+        self.S = S # Grid sizes
+        self.anchors = torch.tensor(anchors[0] + anchors[1] + anchors[2])  # Flatten all anchors
+        self.num_anchors = self.anchors.shape[0]
+        self.num_anchors_per_scale = self.num_anchors // 3
+        self.C = C
+        self.ignore_iou_thresh = 0.5
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, index):
+        label_path = os.path.join(self.label_dir, self.annotations.iloc[index, 1])
+        # Load bboxes: [class, x, y, w, h]
+        bboxes = np.roll(np.loadtxt(fname=label_path, delimiter=" ", ndmin=2), 4, axis=1).tolist()
+        img_path = os.path.join(self.img_dir, self.annotations.iloc[index, 0])
+        image = np.array(Image.open(img_path).convert("RGB"))
+
+        if self.transform:
+            augmentations = self.transform(image=image, bboxes=bboxes)
+            image = augmentations["image"]
+            bboxes = augmentations["bboxes"]
+
+        # Build targets for 3 scales
+        # target shape: [3, Grid_Size, Grid_Size, 3 (anchors), 6 (conf+x+y+w+h+class)]
+        targets = [torch.zeros((self.num_anchors // 3, S, S, 6)) for S in self.S]
+        
+        for box in bboxes:
+            iou_anchors = iou_width_height(torch.tensor(box[2:4]), self.anchors)
+            anchor_indices = iou_anchors.argsort(descending=True, dim=0)
+            x, y, width, height, class_label = box
+            
+            has_anchor = [False] * 3  # Track which scale has already been assigned
+            
+            for anchor_idx in anchor_indices:
+                scale_idx = anchor_idx // self.num_anchors_per_scale
+                anchor_on_scale = anchor_idx % self.num_anchors_per_scale
+                S = self.S[scale_idx]
+                i, j = int(S * y), int(S * x) # Grid Coordinates
+                
+                anchor_taken = targets[scale_idx][anchor_on_scale, i, j, 0]
+                
+                if not anchor_taken and not has_anchor[scale_idx]:
+                    targets[scale_idx][anchor_on_scale, i, j, 0] = 1 # Objectness score
+                    x_cell, y_cell = S * x - j, S * y - i # Relative to cell
+                    width_cell, height_cell = (width * S), (height * S) # Relative to grid size (not pixel)
+                    box_coordinates = torch.tensor([x_cell, y_cell, width_cell, height_cell])
+                    
+                    targets[scale_idx][anchor_on_scale, i, j, 1:5] = box_coordinates
+                    targets[scale_idx][anchor_on_scale, i, j, 5] = int(class_label)
+                    has_anchor[scale_idx] = True
+
+                elif not anchor_taken and iou_anchors[anchor_idx] > self.ignore_iou_thresh:
+                    targets[scale_idx][anchor_on_scale, i, j, 0] = -1  # Ignore prediction (ambiguous)
+
+        return image, tuple(targets)
+
+# -------------------------------------------------------------------
+# 5. LOSS FUNCTION
+# -------------------------------------------------------------------
+class YoloLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.entropy = nn.CrossEntropyLoss()
+        self.sigmoid = nn.Sigmoid()
+
+        # Constants
+        self.lambda_class = 1
+        self.lambda_noobj = 10
+        self.lambda_obj = 1
+        self.lambda_box = 10
+
+    def forward(self, predictions, target, anchors):
+        """
+        predictions: tensor (N, 3, S, S, 5+C)
+        target: tensor (N, 3, S, S, 6) -> [obj_score, x, y, w, h, class]
+        anchors: tensor (3, 2)
+        """
+        obj = target[..., 0] == 1
+        noobj = target[..., 0] == 0
+
+        # --- No Object Loss ---
+        # Penalize network for detecting an object where there isn't one
+        no_object_loss = self.bce(
+            (predictions[..., 0:1][noobj]), (target[..., 0:1][noobj])
+        )
+
+        # --- Object Loss ---
+        # Anchors reshape for broadcasting
+        anchors = anchors.reshape(1, 3, 1, 1, 2)
+        
+        box_preds = torch.cat([self.sigmoid(predictions[..., 1:3]), torch.exp(predictions[..., 3:5]) * anchors], dim=-1)
+        ious = intersection_over_union(box_preds[obj], target[..., 1:5][obj]).detach()
+        object_loss = self.mse(self.sigmoid(predictions[..., 0:1][obj]), ious * target[..., 0:1][obj])
+
+        # --- Box Coordinates Loss ---
+        predictions[..., 1:3] = self.sigmoid(predictions[..., 1:3]) # x, y
+        target[..., 3:5] = torch.log(1e-16 + target[..., 3:5] / anchors) # w, h
+        box_loss = self.mse(predictions[..., 1:5][obj], target[..., 1:5][obj])
+
+        # --- Class Loss ---
+        class_loss = self.entropy(
+            (predictions[..., 5:][obj]), (target[..., 5][obj].long())
+        )
+
+        return (
+            self.lambda_box * box_loss
+            + self.lambda_obj * object_loss
+            + self.lambda_noobj * no_object_loss
+            + self.lambda_class * class_loss
+        )
+
+# -------------------------------------------------------------------
+# 6. TRAINING & INFERENCE PIPELINE
+# -------------------------------------------------------------------
+
+def get_loaders(csv_path, img_dir, label_dir):
+    train_transforms = A.Compose(
+        [
+            A.LongestMaxSize(max_size=IMAGE_SIZE),
+            A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE, border_mode=cv2.BORDER_CONSTANT),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.Normalize(mean=[0, 0, 0], std=[1, 1, 1], max_pixel_value=255,),
+            ToTensorV2(),
+        ],
+        bbox_params=A.BboxParams(format="yolo", min_visibility=0.4, label_fields=[]),
+    )
+
+    dataset = YOLODataset(
+        csv_path, img_dir, label_dir, 
+        anchors=ANCHORS, transform=train_transforms, C=NUM_CLASSES
+    )
+
+    loader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, num_workers=2, shuffle=True, pin_memory=True
+    )
+    return loader
+
+def train_fn(train_loader, model, optimizer, loss_fn, scaler, scaled_anchors):
+    loop = tqdm(train_loader, leave=True)
+    losses = []
+
+    for batch_idx, (x, y) in enumerate(loop):
+        x = x.to(DEVICE)
+        y0, y1, y2 = (y[0].to(DEVICE), y[1].to(DEVICE), y[2].to(DEVICE))
+
+        with torch.cuda.amp.autocast():
+            out = model(x)
+            loss = (
+                loss_fn(out[0], y0, scaled_anchors[0])
+                + loss_fn(out[1], y1, scaled_anchors[1])
+                + loss_fn(out[2], y2, scaled_anchors[2])
+            )
+
+        losses.append(loss.item())
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        loop.set_postfix(loss=loss.item())
+
+def inference(model, img_path):
+    """
+    Run inference on a single image and visualize
+    """
+    model.eval()
+    transform = A.Compose(
+        [
+            A.LongestMaxSize(max_size=IMAGE_SIZE),
+            A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE, border_mode=cv2.BORDER_CONSTANT),
+            A.Normalize(mean=[0, 0, 0], std=[1, 1, 1], max_pixel_value=255,),
+            ToTensorV2(),
+        ],
+    )
+    
+    image = np.array(Image.open(img_path).convert("RGB"))
+    augmented = transform(image=image)["image"].unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        out = model(augmented)
+        
+    # NOTE: To visualize, you need a function to convert cells to bboxes 
+    # and run NMS. For brevity in this advanced script, we print shapes.
+    # In a full app, you would apply cells_to_bboxes() here.
+    print(f"Inference output shapes: {[o.shape for o in out]}")
+    model.train()
+
+# -------------------------------------------------------------------
+# 7. MAIN EXECUTION
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    # --- SETUP MODEL ---
+    model = YOLOv3(num_classes=NUM_CLASSES).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    loss_fn = YoloLoss()
+    scaler = torch.cuda.amp.GradScaler()
+
+    # Scale anchors to the specific grid sizes
+    SCALED_ANCHORS = (
+        torch.tensor(ANCHORS)
+        * torch.tensor([13, 26, 52]).unsqueeze(1).unsqueeze(1).repeat(1, 3, 2)
+    ).to(DEVICE)
+
+    # --- DUMMY DATA GENERATION FOR DEMONSTRATION ---
+    # Since you likely don't have the dataset downloaded immediately,
+    # This block creates a fake environment so the code runs.
+    if not os.path.exists("data"):
+        os.makedirs("data/images", exist_ok=True)
+        os.makedirs("data/labels", exist_ok=True)
+        
+        # Create dummy image
+        dummy_img = Image.new('RGB', (500, 500), color = 'white')
+        dummy_img.save('data/images/test.jpg')
+        
+        # Create dummy label (class 0, center, small box)
+        with open('data/labels/test.txt', 'w') as f:
+            f.write("0 0.5 0.5 0.1 0.1")
+            
+        # Create dummy CSV
+        with open('data/train.csv', 'w') as f:
+            f.write("img,label\n")
+            f.write("test.jpg,test.txt")
+
+    print(f"Training on {DEVICE}...")
+    train_loader = get_loaders("data/train.csv", "data/images/", "data/labels/")
+
+    # --- TRAINING LOOP ---
+    for epoch in range(NUM_EPOCHS):
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}]")
+        train_fn(train_loader, model, optimizer, loss_fn, scaler, SCALED_ANCHORS)
+
+    # --- INFERENCE EXAMPLE ---
+    print("\nRunning Inference...")
+    inference(model, "data/images/test.jpg")
+    print("Done!")
+"""
+Advanced SSD (Single Shot MultiBox Detector) Implementation in PyTorch
+----------------------------------------------------------------------
+This script covers:
+1. SSD300 Architecture (VGG-16 based backbone + Extra Feature Layers)
+2. MultiBox Loss (with Hard Negative Mining)
+3. Prior/Anchor Box Generation (The mathematical core of SSD)
+4. Dataset Class (Encoding bounding boxes to offsets)
+5. Training Loop & Inference
+
+DATASET STRUCTURE (DST) EXPLANATION:
+------------------------------------
+/dataset_root/
+    ├── images/
+    │   ├── img1.jpg ...
+    ├── labels/
+    │   ├── img1.txt ...
+    └── train.csv
+
+LABEL FORMAT (.txt files):
+--------------------------
+Normalized coordinates: <class_id> <center_x> <center_y> <width> <height>
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+import numpy as np
+import os
+import pandas as pd
+import cv2
+from PIL import Image
+from math import sqrt
+from itertools import product as product
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# -------------------------------------------------------------------
+# 1. CONFIGURATION
+# -------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 8
+LR = 1e-3
+NUM_EPOCHS = 10
+NUM_CLASSES = 21  # 20 classes + 1 Background (SSD requires background class)
+IMG_SIZE = 300    # SSD300 standard
+
+# SSD300 Specific Configs
+# Feature map sizes for the 6 detection layers
+MAP_SIZES = [38, 19, 10, 5, 3, 1] 
+# Strides (how much the image shrinks to get to feature map)
+STEPS = [8, 16, 32, 64, 100, 300] 
+# Anchor box scales (min_size, max_size) for each feature map
+MIN_SIZES = [30, 60, 111, 162, 213, 264]
+MAX_SIZES = [60, 111, 162, 213, 264, 315]
+# Aspect ratios for anchors at each feature map
+ASPECT_RATIOS = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
+# Variance helps stabilize regression (scaling the offsets)
+VARIANCE = [0.1, 0.2] 
+
+# -------------------------------------------------------------------
+# 2. UTILS: BOX CODING & IOU
+# -------------------------------------------------------------------
+def point_form(boxes):
+    """Convert (cx, cy, w, h) to (xmin, ymin, xmax, ymax)"""
+    return torch.cat((boxes[:, :2] - boxes[:, 2:]/2,     # xmin, ymin
+                      boxes[:, :2] + boxes[:, 2:]/2), 1) # xmax, ymax
+
+def center_size(boxes):
+    """Convert (xmin, ymin, xmax, ymax) to (cx, cy, w, h)"""
+    return torch.cat(((boxes[:, 2:] + boxes[:, :2])/2,  # cx, cy
+                      boxes[:, 2:] - boxes[:, :2]), 1)  # w, h
+
+def intersect(box_a, box_b):
+    """Calculate Intersection of two sets of boxes (N, 4) and (M, 4)"""
+    A = box_a.size(0)
+    B = box_b.size(0)
+    max_xy = torch.min(box_a[:, 2:].unsqueeze(1).expand(A, B, 2),
+                       box_b[:, 2:].unsqueeze(0).expand(A, B, 2))
+    min_xy = torch.max(box_a[:, :2].unsqueeze(1).expand(A, B, 2),
+                       box_b[:, :2].unsqueeze(0).expand(A, B, 2))
+    inter = torch.clamp((max_xy - min_xy), min=0)
+    return inter[:, :, 0] * inter[:, :, 1]
+
+def jaccard(box_a, box_b):
+    """Calculate IoU (Jaccard Overlap)"""
+    inter = intersect(box_a, box_b)
+    area_a = ((box_a[:, 2]-box_a[:, 0]) * (box_a[:, 3]-box_a[:, 1])).unsqueeze(1).expand_as(inter)
+    area_b = ((box_b[:, 2]-box_b[:, 0]) * (box_b[:, 3]-box_b[:, 1])).unsqueeze(0).expand_as(inter)
+    union = area_a + area_b - inter
+    return inter / union
+
+def encode(matched, priors, variances):
+    """
+    Encode the ground truth boxes into SSD offsets.
+    matched: (cx, cy, w, h)
+    priors: (cx, cy, w, h)
+    """
+    g_cxcy = (matched[:, :2] - priors[:, :2]) / (variances[0] * priors[:, 2:])
+    g_wh = torch.log(matched[:, 2:] / priors[:, 2:]) / variances[1]
+    return torch.cat([g_cxcy, g_wh], 1)
+
+def decode(loc, priors, variances):
+    """
+    Decode SSD offsets back to bounding boxes.
+    """
+    boxes = torch.cat((
+        priors[:, :2] + loc[:, :2] * variances[0] * priors[:, 2:],
+        priors[:, 2:] * torch.exp(loc[:, 2:] * variances[1])), 1)
+    return boxes
+
+# -------------------------------------------------------------------
+# 3. PRIOR BOX GENERATION
+# -------------------------------------------------------------------
+class PriorBox(object):
+    """
+    Generates the reference "Anchor" boxes for SSD.
+    Unlike YOLO, these are fixed geometric calculations, not K-means.
+    """
+    def __init__(self):
+        self.image_size = IMG_SIZE
+        self.feature_maps = MAP_SIZES
+        self.steps = STEPS
+        self.min_sizes = MIN_SIZES
+        self.max_sizes = MAX_SIZES
+        self.aspect_ratios = ASPECT_RATIOS
+
+    def forward(self):
+        mean = []
+        # Iterate over the 6 feature maps
+        for k, f in enumerate(self.feature_maps):
+            for i, j in product(range(f), range(f)):
+                f_k = self.image_size / self.steps[k]
+                # Center of the prior box (normalized 0-1)
+                cx = (j + 0.5) / f_k
+                cy = (i + 0.5) / f_k
+
+                s_k = self.min_sizes[k] / self.image_size
+                # 1. Aspect Ratio 1 (Small)
+                mean += [cx, cy, s_k, s_k]
+
+                # 2. Aspect Ratio 1 (Large) - geometric mean
+                s_k_prime = sqrt(s_k * (self.max_sizes[k] / self.image_size))
+                mean += [cx, cy, s_k_prime, s_k_prime]
+
+                # 3. Rest of aspect ratios
+                for ar in self.aspect_ratios[k]:
+                    mean += [cx, cy, s_k * sqrt(ar), s_k / sqrt(ar)]
+                    mean += [cx, cy, s_k / sqrt(ar), s_k * sqrt(ar)]
+        
+        # Output shape: [Num_Priors, 4] -> (cx, cy, w, h)
+        output = torch.Tensor(mean).view(-1, 4)
+        output.clamp_(max=1, min=0)
+        return output
+
+# -------------------------------------------------------------------
+# 4. MODEL ARCHITECTURE
+# -------------------------------------------------------------------
+class SSD(nn.Module):
+    def __init__(self, num_classes):
+        super(SSD, self).__init__()
+        self.num_classes = num_classes
+        
+        # 1. Base (VGG16-like)
+        self.vgg = self.build_vgg()
+        # 2. Extras (Downsampling layers)
+        self.extras = self.build_extras()
+        # 3. Heads (Conf + Loc predictors)
+        self.loc, self.conf = self.build_head(self.vgg, self.extras)
+        
+        # Precompute priors
+        self.priors = PriorBox().forward().to(DEVICE)
+
+    def forward(self, x):
+        sources = []
+        loc = []
+        conf = []
+
+        # -- VGG Forward --
+        # We need to pull features from specific layers (Conv4_3 and Conv7)
+        for k in range(23):
+            x = self.vgg[k](x)
+        
+        # L2 Norm is often applied to Conv4_3 in SSD, skipping for brevity but recommended
+        sources.append(x) # Conv4_3 feature map
+
+        for k in range(23, len(self.vgg)):
+            x = self.vgg[k](x)
+        sources.append(x) # Conv7 feature map
+
+        # -- Extras Forward --
+        for k, v in enumerate(self.extras):
+            x = F.relu(v(x), inplace=True)
+            if k % 2 == 1: # Capture output after every 2nd layer (stride 2)
+                sources.append(x)
+
+        # -- Heads Forward --
+        # Apply loc and conf layers to the collected feature maps
+        for (x, l, c) in zip(sources, self.loc, self.conf):
+            # permute to (Batch, H, W, Channels) for contiguous flattening
+            loc.append(l(x).permute(0, 2, 3, 1).contiguous())
+            conf.append(c(x).permute(0, 2, 3, 1).contiguous())
+
+        loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
+        conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
+
+        # Reshape:
+        # Loc: (Batch, Num_Priors, 4)
+        # Conf: (Batch, Num_Priors, Num_Classes)
+        return (
+            loc.view(loc.size(0), -1, 4),
+            conf.view(conf.size(0), -1, self.num_classes)
+        )
+
+    def build_vgg(self):
+        """Simplified VGG16 with dilation"""
+        layers = []
+        in_channels = 3
+        # VGG Config: 'M' is MaxPool
+        cfg = [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'C', 512, 512, 512, 'M', 512, 512, 512]
+        
+        for v in cfg:
+            if v == 'M':
+                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+            elif v == 'C': # Ceil mode maxpool
+                layers += [nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)]
+            else:
+                layers += [nn.Conv2d(in_channels, v, kernel_size=3, padding=1), nn.ReLU(inplace=True)]
+                in_channels = v
+        
+        # The modified layers for SSD (FC6/FC7 turned into Conv)
+        pool5 = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+        conv6 = nn.Conv2d(512, 1024, kernel_size=3, padding=6, dilation=6)
+        conv7 = nn.Conv2d(1024, 1024, kernel_size=1)
+        layers += [pool5, conv6, nn.ReLU(inplace=True), conv7, nn.ReLU(inplace=True)]
+        return nn.ModuleList(layers)
+
+    def build_extras(self):
+        """Layers added on top of VGG to get smaller feature maps"""
+        layers = []
+        in_channels = 1024
+        # (out_channels, kernel, stride, padding)
+        cfg = [(256, 1, 1, 0), (512, 3, 2, 1),  # 10x10
+               (128, 1, 1, 0), (256, 3, 2, 1),  # 5x5
+               (128, 1, 1, 0), (256, 3, 1, 0),  # 3x3
+               (128, 1, 1, 0), (256, 3, 1, 0)]  # 1x1
+        
+        for k, v in enumerate(cfg):
+            layers.append(nn.Conv2d(in_channels if k % 2 == 0 else cfg[k-1][0], 
+                                    v[0], kernel_size=v[1], stride=v[2], padding=v[3]))
+        return nn.ModuleList(layers)
+
+    def build_head(self, vgg, extras):
+        loc_layers = []
+        conf_layers = []
+        
+        # Sources in VGG are at index 21 (Conv4_3) and -2 (Conv7)
+        vgg_source = [21, -2]
+        
+        # Box counts per location for the 6 layers
+        # 4 boxes for 38x38, 6 for 19x19, etc.
+        mbox = [4, 6, 6, 6, 4, 4] 
+        
+        # VGG Heads
+        for k, v in enumerate(vgg_source):
+            loc_layers += [nn.Conv2d(vgg[v].out_channels, mbox[k] * 4, kernel_size=3, padding=1)]
+            conf_layers += [nn.Conv2d(vgg[v].out_channels, mbox[k] * self.num_classes, kernel_size=3, padding=1)]
+            
+        # Extra Heads
+        for k, v in enumerate(extras[1::2], 2): # Steps of 2 because extras has [1x1, 3x3] pairs
+            loc_layers += [nn.Conv2d(v.out_channels, mbox[k] * 4, kernel_size=3, padding=1)]
+            conf_layers += [nn.Conv2d(v.out_channels, mbox[k] * self.num_classes, kernel_size=3, padding=1)]
+            
+        return nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
+
+# -------------------------------------------------------------------
+# 5. MULTIBOX LOSS (Advanced: Hard Negative Mining)
+# -------------------------------------------------------------------
+class MultiBoxLoss(nn.Module):
+    def __init__(self):
+        super(MultiBoxLoss, self).__init__()
+        self.threshold = 0.5
+        self.neg_pos_ratio = 3  # For every 1 positive, we mine 3 hard negatives
+        self.variance = VARIANCE
+
+    def forward(self, predictions, targets):
+        """
+        predictions: (loc_preds, conf_preds)
+        targets: [batch_size, num_objs, 5] (last 5 are class + coords)
+        """
+        loc_data, conf_data = predictions
+        batch_size = loc_data.size(0)
+        num_priors = loc_data.size(1)
+        priors = model.priors # (8732, 4)
+
+        # We must match Ground Truth to Priors for every image in batch
+        loc_t = torch.Tensor(batch_size, num_priors, 4).to(DEVICE)
+        conf_t = torch.LongTensor(batch_size, num_priors).to(DEVICE)
+
+        for idx in range(batch_size):
+            truths = targets[idx][:, 1:5].data # (x,y,w,h)
+            labels = targets[idx][:, 0].data   # Class Label
+            
+            # --- MATCHING STRATEGY (Bipartite Matching) ---
+            # 1. Convert priors to (xmin, ymin, xmax, ymax)
+            priors_point = point_form(priors)
+            truths_point = point_form(truths)
+            
+            # 2. Calc IoU matrix [Num_Truths, Num_Priors]
+            overlaps = jaccard(truths_point, priors_point)
+            
+            # 3. Best ground truth for each prior
+            best_truth_overlap, best_truth_idx = overlaps.max(0) 
+            
+            # 4. Best prior for each ground truth (Ensure every object is caught)
+            best_prior_overlap, best_prior_idx = overlaps.max(1)
+            
+            # Force the best matching priors to point to their GT
+            for j in range(best_prior_idx.size(0)):
+                best_truth_idx[best_prior_idx[j]] = j
+            
+            # 5. Assign labels
+            matches = truths[best_truth_idx] # Shape: [Num_Priors, 4]
+            conf = labels[best_truth_idx] + 1 # +1 for background (0 is bg)
+            
+            # 6. Filtering
+            # If IoU < threshold, set as Background (0)
+            conf[best_truth_overlap < self.threshold] = 0
+            
+            # 7. Encode matches into offsets
+            loc = encode(matches, priors, self.variance)
+            
+            loc_t[idx] = loc
+            conf_t[idx] = conf
+
+        # --- LOCALIZATION LOSS (Smooth L1) ---
+        # Only compute loc loss for positives (non-background)
+        pos = conf_t > 0 # Mask [Batch, Num_Priors]
+        
+        # Expand mask for 4 coords
+        pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
+        loc_p = loc_data[pos_idx].view(-1, 4)
+        loc_t = loc_t[pos_idx].view(-1, 4)
+        loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction='sum')
+
+        # --- CONFIDENCE LOSS (with Hard Negative Mining) ---
+        # We can't use all negatives (class imbalance). 
+        # We sort negatives by confidence loss and pick top 3*positives.
+        
+        # 1. Compute CrossEntropy for ALL priors (without reduction)
+        batch_conf = conf_data.view(-1, self.num_classes)
+        loss_c = F.cross_entropy(batch_conf, conf_t.view(-1), reduction='none')
+        loss_c = loss_c.view(batch_size, -1)
+        
+        # 2. Hard Negative Mining
+        loss_c[pos] = 0 # filter out positives (we want to sort negatives)
+        _, loss_idx = loss_c.sort(1, descending=True)
+        _, idx_rank = loss_idx.sort(1)
+        
+        num_pos = pos.long().sum(1, keepdim=True)
+        num_neg = torch.clamp(self.neg_pos_ratio * num_pos, max=pos.size(1)-1)
+        
+        # Mask for selected negatives
+        neg = idx_rank < num_neg.expand_as(idx_rank)
+        
+        # 3. Final Conf Loss (Positives + Hard Negatives)
+        pos_idx = pos.unsqueeze(2).expand_as(conf_data)
+        neg_idx = neg.unsqueeze(2).expand_as(conf_data)
+        
+        conf_p = conf_data[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)
+        targets_weighted = conf_t[(pos + neg).gt(0)]
+        loss_c = F.cross_entropy(conf_p, targets_weighted, reduction='sum')
+
+        # Normalize by number of positives
+        N = num_pos.data.sum()
+        loss_l /= N
+        loss_c /= N
+        return loss_l + loss_c
+
+# -------------------------------------------------------------------
+# 6. DATASET
+# -------------------------------------------------------------------
+class SSDDataset(Dataset):
+    def __init__(self, csv_file, img_dir, label_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.label_dir = label_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, index):
+        img_path = os.path.join(self.img_dir, self.annotations.iloc[index, 0])
+        label_path = os.path.join(self.label_dir, self.annotations.iloc[index, 1])
+        
+        image = np.array(Image.open(img_path).convert("RGB"))
+        
+        # Load Labels: [class, x, y, w, h] (normalized)
+        boxes = []
+        if os.path.exists(label_path):
+            with open(label_path) as f:
+                for line in f:
+                    data = line.strip().split()
+                    # SSD expects [class, x, y, w, h]
+                    boxes.append([int(float(data[0])), float(data[1]), float(data[2]), float(data[3]), float(data[4])])
+        
+        if self.transform:
+            # Albumentations expects [x, y, w, h, class] usually, handle carefully
+            # Here assuming simple list handling
+            box_only = [b[1:] for b in boxes]
+            labels = [b[0] for b in boxes]
+            aug = self.transform(image=image, bboxes=box_only, class_labels=labels)
+            image = aug['image']
+            boxes = []
+            for box, label in zip(aug['bboxes'], aug['class_labels']):
+                boxes.append([label] + list(box))
+
+        # Convert to Tensor [Num_Objs, 5]
+        target = torch.tensor(boxes)
+        return image, target
+
+    @staticmethod
+    def collate_fn(batch):
+        """
+        Since each image has a different number of objects, we cannot 
+        stack targets into a single tensor. return list of tensors.
+        """
+        images = list()
+        targets = list()
+        for b in batch:
+            images.append(b[0])
+            targets.append(b[1])
+        images = torch.stack(images, dim=0)
+        return images, targets
+
+# -------------------------------------------------------------------
+# 7. TRAINING & INFERENCE
+# -------------------------------------------------------------------
+def get_transforms():
+    return A.Compose([
+        A.Resize(height=IMG_SIZE, width=IMG_SIZE),
+        A.HorizontalFlip(p=0.5),
+        A.ColorJitter(p=0.2),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'])) 
+    # Note: Input txt is yolo format (center, w, h), so we keep that here.
+
+def train_fn(loader, model, optimizer, criterion):
+    model.train()
+    loop = tqdm(loader, leave=True)
+    total_loss = 0
+    
+    for batch_idx, (images, targets) in enumerate(loop):
+        images = images.to(DEVICE)
+        # Targets is a list of tensors, move each to device
+        targets = [t.to(DEVICE) for t in targets]
+
+        out = model(images)
+        loss = criterion(out, targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        loop.set_postfix(loss=loss.item())
+        
+    return total_loss / len(loader)
+
+def inference(model, img_path):
+    model.eval()
+    transform = A.Compose([
+        A.Resize(height=IMG_SIZE, width=IMG_SIZE),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
+    
+    img = np.array(Image.open(img_path).convert("RGB"))
+    aug = transform(image=img)["image"].unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        loc_preds, conf_preds = model(aug)
+    
+    # --- POST PROCESSING (Simplified NMS) ---
+    priors = model.priors
+    conf_preds = F.softmax(conf_preds, dim=2)
+    
+    # Example decoding for the first image in batch
+    score_thresh = 0.5
+    nms_thresh = 0.45
+    
+    boxes = decode(loc_preds[0], priors, VARIANCE)
+    scores = conf_preds[0] # (8732, Num_Classes)
+    
+    # Skip background (class 0)
+    for cls_ind in range(1, NUM_CLASSES):
+        cls_scores = scores[:, cls_ind]
+        mask = cls_scores > score_thresh
+        if mask.sum() == 0: continue
+        
+        masked_scores = cls_scores[mask]
+        masked_boxes = boxes[mask]
+        
+        # Convert to corners for NMS
+        corners = point_form(masked_boxes) 
+        
+        # Apply standard Torch NMS
+        keep = torch.ops.torchvision.nms(corners, masked_scores, nms_thresh)
+        
+        final_boxes = masked_boxes[keep]
+        print(f"Detected Class {cls_ind} Count: {len(final_boxes)}")
+        # In a real app, you would draw these boxes here.
+
+if __name__ == "__main__":
+    # --- DUMMY DATA SETUP (To make script runnable) ---
+    if not os.path.exists("ssd_data"):
+        os.makedirs("ssd_data/images", exist_ok=True)
+        os.makedirs("ssd_data/labels", exist_ok=True)
+        # Dummy Image
+        Image.new('RGB', (300, 300), color='white').save('ssd_data/images/test.jpg')
+        # Dummy Label (Class 1, Center, Small Box)
+        with open('ssd_data/labels/test.txt', 'w') as f:
+            f.write("1 0.5 0.5 0.2 0.2") # Format: Class cx cy w h
+        # Dummy CSV
+        with open('ssd_data/train.csv', 'w') as f:
+            f.write("img,label\n")
+            f.write("test.jpg,test.txt")
+
+    # --- SETUP ---
+    model = SSD(num_classes=NUM_CLASSES).to(DEVICE)
+    optimizer = optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
+    criterion = MultiBoxLoss()
+    
+    dataset = SSDDataset("ssd_data/train.csv", "ssd_data/images/", "ssd_data/labels/", transform=get_transforms())
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=SSDDataset.collate_fn)
+
+    print(f"Starting Training on {DEVICE}...")
+    for epoch in range(NUM_EPOCHS):
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        train_fn(loader, model, optimizer, criterion)
+
+    print("\nRunning Inference...")
+    inference(model, "ssd_data/images/test.jpg")
+"""
+Advanced DETR (DEtection TRansformer) Implementation in PyTorch
+---------------------------------------------------------------
+This script covers:
+1. DETR Architecture (ResNet backbone + Transformer Encoder/Decoder)
+2. Learned Object Queries (The core "anchors" of DETR)
+3. Positional Encodings (Sine/Cosine)
+4. Hungarian Matcher (Bipartite Matching using Scipy)
+5. Set-based Loss Function (Labels + Box L1 + GIoU)
+6. Dataset & Training Loop
+
+DATASET STRUCTURE (DST) EXPLANATION:
+------------------------------------
+/dataset_root/
+    ├── images/
+    │   ├── img1.jpg ...
+    ├── labels/
+    │   ├── img1.txt ...
+    └── train.csv
+
+LABEL FORMAT (.txt):
+<class_id> <center_x> <center_y> <width> <height> (Normalized 0-1)
+
+CONCEPT: SET PREDICTION
+-----------------------
+DETR always outputs a fixed set of N predictions (e.g., N=100).
+If an image has 3 objects, DETR learns to output:
+- 3 Valid Objects
+- 97 "No Object" (Ø) predictions.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+import os
+import pandas as pd
+from PIL import Image
+from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import torchvision.ops as ops
+
+# -------------------------------------------------------------------
+# 1. CONFIGURATION
+# -------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LR = 1e-4
+LR_BACKBONE = 1e-5
+BATCH_SIZE = 4
+NUM_EPOCHS = 10
+NUM_CLASSES = 20  # Actual classes
+NUM_QUERIES = 100 # Maximum number of objects the model can detect per image
+HIDDEN_DIM = 256
+NHEADS = 8
+NUM_ENCODER_LAYERS = 6
+NUM_DECODER_LAYERS = 6
+DROPOUT = 0.1
+
+# Costs for Hungarian Matcher
+COST_CLASS = 1.0
+COST_BBOX = 5.0
+COST_GIOU = 2.0
+
+# -------------------------------------------------------------------
+# 2. UTILS & POSITIONAL ENCODING
+# -------------------------------------------------------------------
+class PositionalEncoding(nn.Module):
+    """
+    Standard Sine/Cosine Positional Encoding.
+    Since Transformers have no notion of grid/space, we must add this 
+    to the feature map so the model knows where pixels are relative to each other.
+    """
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [Seq_Len, Batch, Dim]
+        return x + self.pe[:x.size(0), :].unsqueeze(1)
+
+def box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
+
+def box_xyxy_to_cxcywh(x):
+    x0, y0, x1, y1 = x.unbind(-1)
+    b = [(x0 + x1) / 2, (y0 + y1) / 2,
+         (x1 - x0), (y1 - y0)]
+    return torch.stack(b, dim=-1)
+
+# -------------------------------------------------------------------
+# 3. DETR MODEL ARCHITECTURE
+# -------------------------------------------------------------------
+class DETR(nn.Module):
+    def __init__(self, num_classes, hidden_dim, nheads, num_encoder_layers, num_decoder_layers):
+        super().__init__()
+        
+        # 1. Backbone (ResNet50)
+        # We take features from the last convolutional layer
+        resnet = models.resnet50(pretrained=True)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # 1x1 Conv to project ResNet features (2048 ch) to Transformer Dim (256 ch)
+        self.conv = nn.Conv2d(2048, hidden_dim, 1)
+        
+        # 2. Transformer
+        self.transformer = nn.Transformer(
+            d_model=hidden_dim,
+            nhead=nheads,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=2048,
+            dropout=DROPOUT
+        )
+        
+        # 3. Object Queries (The "Anchors" of DETR)
+        # Learnable embeddings that "ask" the decoder for objects
+        self.query_embed = nn.Embedding(NUM_QUERIES, hidden_dim)
+        
+        # 4. Prediction Heads
+        # Class head: +1 for "No Object" class
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1) 
+        self.bbox_embed = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),
+            nn.Sigmoid() # Boxes are normalized [0,1]
+        )
+        
+        self.pos_encoder = PositionalEncoding(hidden_dim)
+
+    def forward(self, x):
+        # x: [Batch, 3, H, W]
+        
+        # -- Backbone --
+        features = self.backbone(x) # [Batch, 2048, H/32, W/32]
+        h = self.conv(features)     # [Batch, 256, H', W']
+        
+        # -- Prepare for Transformer --
+        # Transformer expects [Seq_Len, Batch, Dim]
+        bs, c, h_map, w_map = h.shape
+        # Flatten spatial dims into sequence: (H'*W')
+        src = h.flatten(2).permute(2, 0, 1) # [Seq_Len, Batch, Dim]
+        
+        # Add Positional Encoding
+        src = self.pos_encoder(src)
+        
+        # Prepare Queries: [Num_Queries, Batch, Dim]
+        query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        
+        # -- Transformer Pass --
+        # Target (tgt) for decoder is usually the object queries
+        # Memory is the output of the encoder
+        hs = self.transformer(src, query_embed) # Output: [Num_Queries, Batch, Dim]
+        
+        # -- Prediction Heads --
+        # Permute to [Batch, Num_Queries, Dim]
+        hs = hs.permute(1, 0, 2)
+        
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs)
+        
+        return {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
+
+# -------------------------------------------------------------------
+# 4. HUNGARIAN MATCHER
+# -------------------------------------------------------------------
+class HungarianMatcher(nn.Module):
+    """
+    Computes an assignment between the targets and the predictions of the network.
+    It computes the cost matrix for every (prediction, target) pair and finds
+    the optimal one-to-one mapping using Scipy's linear_sum_assignment.
+    """
+    def __init__(self, cost_class=1, cost_bbox=5, cost_giou=2):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """
+        outputs: dict with 'pred_logits' [Batch, Num_Queries, Classes+1] 
+                 and 'pred_boxes' [Batch, Num_Queries, 4]
+        targets: list of dicts (len=Batch), each with 'labels' and 'boxes'
+        """
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+
+        # Flatten batch to compute cost matrix in parallel
+        # Probs: [Batch * Num_Queries, Num_Classes]
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [Batch * Num_Queries, 4]
+
+        # Concat target labels and boxes
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+        # 1. Classification Cost
+        # We want high probability for the correct class. 
+        # Cost = -Probability of ground truth class
+        cost_class = -out_prob[:, tgt_ids]
+
+        # 2. Box L1 Cost
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+
+        # 3. GIoU Cost
+        # generalized_box_iou returns IoU matrix. Cost = 1 - GIoU
+        cost_giou = -ops.generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+        # Final Cost Matrix
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = C.view(bs, num_queries, -1).cpu()
+
+        sizes = [len(v["boxes"]) for v in targets]
+        
+        # Perform Hungarian Matching (linear_sum_assignment) for each image in batch
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        
+        # Return list of tuples: [(pred_idx, target_idx), ...]
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
+# -------------------------------------------------------------------
+# 5. LOSS FUNCTION
+# -------------------------------------------------------------------
+class SetCriterion(nn.Module):
+    """
+    The loss computation based on the matcher's assignment.
+    """
+    def __init__(self, num_classes, matcher, eos_coef=0.1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.eos_coef = eos_coef # Weight for "No Object" class
+        # Weights for different loss components
+        self.weight_dict = {'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2}
+
+    def loss_labels(self, outputs, targets, indices, num_boxes):
+        """Classification loss (NLL)"""
+        src_logits = outputs['pred_logits']
+        
+        # Construct the target classes tensor
+        # Default: Full of "No Object" class (index = num_classes)
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        
+        # Assign actual object classes to the matched indices
+        target_classes[idx] = target_classes_o
+
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, 
+                                  weight=self._get_class_weights(src_logits.device))
+        return {'loss_ce': loss_ce}
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        """L1 and GIoU loss for bounding boxes"""
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        loss_giou = 1 - torch.diag(ops.generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes),
+            box_cxcywh_to_xyxy(target_boxes)
+        ))
+
+        return {
+            'loss_bbox': loss_bbox.sum() / num_boxes,
+            'loss_giou': loss_giou.sum() / num_boxes,
+        }
+
+    def _get_src_permutation_idx(self, indices):
+        # Merge the batch dimension and index dimension
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_class_weights(self, device):
+        # Down-weight the "No Object" class because it dominates
+        weights = torch.ones(self.num_classes + 1, device=device)
+        weights[-1] = self.eos_coef
+        return weights
+
+    def forward(self, outputs, targets):
+        indices = self.matcher(outputs, targets)
+        
+        # Compute average number of target boxes across all nodes (for normalization)
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=outputs['pred_boxes'].device)
+        
+        losses = {}
+        losses.update(self.loss_labels(outputs, targets, indices, num_boxes))
+        losses.update(self.loss_boxes(outputs, targets, indices, num_boxes))
+        
+        return losses
+
+# -------------------------------------------------------------------
+# 6. DATASET
+# -------------------------------------------------------------------
+class DETRDataset(Dataset):
+    def __init__(self, csv_file, img_dir, label_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.label_dir = label_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, index):
+        img_id = self.annotations.iloc[index, 0]
+        label_id = self.annotations.iloc[index, 1]
+        
+        img_path = os.path.join(self.img_dir, img_id)
+        image = np.array(Image.open(img_path).convert("RGB"))
+        
+        boxes = []
+        class_labels = []
+        
+        label_path = os.path.join(self.label_dir, label_id)
+        if os.path.exists(label_path):
+            with open(label_path) as f:
+                for line in f:
+                    data = line.strip().split()
+                    class_labels.append(int(float(data[0])))
+                    boxes.append([float(x) for x in data[1:]]) # cx, cy, w, h
+        
+        if self.transform:
+            # Albumentations
+            aug = self.transform(image=image, bboxes=boxes, class_labels=class_labels)
+            image = aug['image']
+            boxes = aug['bboxes']
+            class_labels = aug['class_labels']
+
+        # Convert to tensors
+        target = {}
+        target["boxes"] = torch.tensor(boxes, dtype=torch.float32)
+        target["labels"] = torch.tensor(class_labels, dtype=torch.int64)
+        
+        return image, target
+
+def collate_fn(batch):
+    # DETR needs specific collation because targets are list of dicts
+    return tuple(zip(*batch))
+
+# -------------------------------------------------------------------
+# 7. TRAINING LOOP
+# -------------------------------------------------------------------
+def get_transform():
+    return A.Compose([
+        A.Resize(800, 800), # DETR likes larger images
+        A.HorizontalFlip(p=0.5),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
+
+def train_one_epoch(model, criterion, data_loader, optimizer, device):
+    model.train()
+    criterion.train()
+    
+    total_loss = 0
+    loop = tqdm(data_loader)
+    
+    for images, targets in loop:
+        images = torch.stack(images).to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
+        outputs = model(images)
+        loss_dict = criterion(outputs, targets)
+        
+        # Weighted sum of losses
+        weight_dict = criterion.weight_dict
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
+        
+        optimizer.zero_grad()
+        losses.backward()
+        # Gradient clipping is important for Transformers
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1) 
+        optimizer.step()
+        
+        total_loss += losses.item()
+        loop.set_postfix(loss=losses.item())
+        
+    return total_loss / len(data_loader)
+
+# -------------------------------------------------------------------
+# 8. INFERENCE
+# -------------------------------------------------------------------
+def inference(model, img_path, threshold=0.7):
+    model.eval()
+    transform = A.Compose([
+        A.Resize(800, 800),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
+    
+    im_pil = Image.open(img_path).convert("RGB")
+    img_np = np.array(im_pil)
+    img_tensor = transform(image=img_np)["image"].unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        outputs = model(img_tensor)
+        
+    # Process outputs
+    pred_logits = outputs['pred_logits'][0] # [100, Classes+1]
+    pred_boxes = outputs['pred_boxes'][0]   # [100, 4]
+    
+    probas = pred_logits.softmax(-1)[:, :-1] # Exclude last class (No Object)
+    keep = probas.max(-1).values > threshold
+    
+    valid_boxes = pred_boxes[keep]
+    valid_probs = probas[keep]
+    
+    print(f"Inference: Found {len(valid_boxes)} objects > {threshold} confidence.")
+    print(f"Box Coords (cx, cy, w, h): \n{valid_boxes.cpu().numpy()}")
+
+# -------------------------------------------------------------------
+# 9. MAIN
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    # --- DUMMY DATA ---
+    if not os.path.exists("detr_data"):
+        os.makedirs("detr_data/images", exist_ok=True)
+        os.makedirs("detr_data/labels", exist_ok=True)
+        Image.new('RGB', (800, 800), color='white').save('detr_data/images/test.jpg')
+        with open('detr_data/labels/test.txt', 'w') as f:
+            f.write("1 0.5 0.5 0.2 0.2") 
+        with open('detr_data/train.csv', 'w') as f:
+            f.write("img,label\n")
+            f.write("test.jpg,test.txt")
+
+    # --- INIT MODEL ---
+    # Note: DETR usually needs longer training or pretrained weights
+    model = DETR(num_classes=NUM_CLASSES, hidden_dim=HIDDEN_DIM, 
+                 nheads=NHEADS, num_encoder_layers=NUM_ENCODER_LAYERS, 
+                 num_decoder_layers=NUM_DECODER_LAYERS).to(DEVICE)
+    
+    matcher = HungarianMatcher(cost_class=COST_CLASS, cost_bbox=COST_BBOX, cost_giou=COST_GIOU)
+    criterion = SetCriterion(NUM_CLASSES, matcher, eos_coef=0.1).to(DEVICE)
+    
+    # DETR uses different LRs for backbone and transformer
+    param_dicts = [
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad], "lr": LR_BACKBONE},
+    ]
+    optimizer = torch.optim.AdamW(param_dicts, lr=LR, weight_decay=1e-4)
+    
+    # --- LOAD DATA ---
+    dataset = DETRDataset("detr_data/train.csv", "detr_data/images/", "detr_data/labels/", transform=get_transform())
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    
+    # --- TRAIN ---
+    print(f"Training DETR on {DEVICE}...")
+    for epoch in range(NUM_EPOCHS):
+        loss = train_one_epoch(model, criterion, loader, optimizer, DEVICE)
+        print(f"Epoch {epoch+1} Loss: {loss:.4f}")
+        
+    inference(model, "detr_data/images/test.jpg")
