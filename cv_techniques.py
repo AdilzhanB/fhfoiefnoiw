@@ -299,7 +299,90 @@ class UNet(nn.Module):
         dec1 = self.dec1(dec1)
         
         return self.out(dec1)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F  # <--- Added this import
 
+class UNet(nn.Module):
+    def __init__(self, in_channels=6, num_classes=1): # See note below about num_classes
+        super(UNet, self).__init__()
+        
+        # Encoder
+        self.enc1 = self.conv_block(in_channels, 64)
+        self.enc2 = self.conv_block(64, 128)
+        self.enc3 = self.conv_block(128, 256)
+        self.enc4 = self.conv_block(256, 512)
+        
+        # Bottleneck
+        self.bottleneck = self.conv_block(512, 1024)
+        
+        # Decoder
+        self.upconv4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec4 = self.conv_block(1024, 512)
+        self.upconv3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec3 = self.conv_block(512, 256)
+        self.upconv2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = self.conv_block(256, 128)
+        self.upconv1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = self.conv_block(128, 64)
+        
+        self.out = nn.Conv2d(64, num_classes, 1)
+        self.pool = nn.MaxPool2d(2)
+        
+    def conv_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        # Encoder
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool(enc1))
+        enc3 = self.enc3(self.pool(enc2))
+        enc4 = self.enc4(self.pool(enc3))
+        
+        # Bottleneck
+        bottleneck = self.bottleneck(self.pool(enc4))
+        
+        # Decoder 4
+        dec4 = self.upconv4(bottleneck)
+        # Pad dec4 to match enc4 shape if they differ
+        diffY = enc4.size()[2] - dec4.size()[2]
+        diffX = enc4.size()[3] - dec4.size()[3]
+        dec4 = F.pad(dec4, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        dec4 = torch.cat([dec4, enc4], dim=1)
+        dec4 = self.dec4(dec4)
+        
+        # Decoder 3 (This is where your error was)
+        dec3 = self.upconv3(dec4)
+        diffY = enc3.size()[2] - dec3.size()[2]
+        diffX = enc3.size()[3] - dec3.size()[3]
+        dec3 = F.pad(dec3, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        dec3 = torch.cat([dec3, enc3], dim=1)
+        dec3 = self.dec3(dec3)
+        
+        # Decoder 2
+        dec2 = self.upconv2(dec3)
+        diffY = enc2.size()[2] - dec2.size()[2]
+        diffX = enc2.size()[3] - dec2.size()[3]
+        dec2 = F.pad(dec2, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        dec2 = torch.cat([dec2, enc2], dim=1)
+        dec2 = self.dec2(dec2)
+        
+        # Decoder 1
+        dec1 = self.upconv1(dec2)
+        diffY = enc1.size()[2] - dec1.size()[2]
+        diffX = enc1.size()[3] - dec1.size()[3]
+        dec1 = F.pad(dec1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        dec1 = torch.cat([dec1, enc1], dim=1)
+        dec1 = self.dec1(dec1)
+        
+        return self.out(dec1)
 # DeepLab with ASPP (Atrous Spatial Pyramid Pooling)
 class ASPP(nn.Module):
     def __init__(self, in_channels, out_channels):
