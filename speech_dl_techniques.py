@@ -835,6 +835,7 @@ import torch
 import numpy as np
 import librosa
 from typing import Dict, List, Union, Literal
+from tqdm.auto import tqdm  # Progress bar
 from transformers import (
     Wav2Vec2Model, 
     Wav2Vec2Processor, 
@@ -846,179 +847,143 @@ class AudioEmbeddingExtractor:
     def __init__(self, 
                  mode: Literal['wav', 'whisper', 'fusion'] = 'wav', 
                  device: str = None):
-        """
-        Args:
-            mode: 'wav' (Wav2Vec2), 'whisper' (Whisper Encoder), or 'fusion' (Both).
-            device: 'cuda' or 'cpu'. Detects automatically if None.
-        """
         self.mode = mode
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"Initializing AudioEmbeddingExtractor on {self.device} in '{self.mode}' mode...")
-        
         self._load_models()
 
     def _load_models(self):
-        # 1. Load Wav2Vec2 (if mode is 'wav' or 'fusion')
+        # 1. Load Wav2Vec2
         if self.mode in ['wav', 'fusion']:
-            print("Loading Wav2Vec2 model...")
             self.w2v_name = "facebook/wav2vec2-base-960h"
             self.w2v_processor = Wav2Vec2Processor.from_pretrained(self.w2v_name)
             self.w2v_model = Wav2Vec2Model.from_pretrained(self.w2v_name).to(self.device)
             self.w2v_model.eval()
 
-        # 2. Load Whisper (if mode is 'whisper' or 'fusion')
-        # We only need the encoder for embeddings, not the decoder
+        # 2. Load Whisper
         if self.mode in ['whisper', 'fusion']:
-            print("Loading Whisper model...")
             self.whisper_name = "openai/whisper-base"
             self.whisper_processor = WhisperProcessor.from_pretrained(self.whisper_name)
             self.whisper_model = WhisperModel.from_pretrained(self.whisper_name).to(self.device)
             self.whisper_model.config.forced_decoder_ids = None 
             self.whisper_model.eval()
 
-    def _load_audio_batch(self, paths: List[str]) -> List[np.ndarray]:
-        """Loads audio files and resamples to 16kHz."""
+    def _load_audio_batch(self, paths: List[str], min_samples: int = 4000) -> List[np.ndarray]:
+        """
+        Loads audio, resamples to 16k, and ensures minimum length to prevent Conv1D errors.
+        min_samples=4000 corresponds to 0.25 seconds, which is safe for Wav2Vec2.
+        """
         batch_audio = []
         for path in paths:
-            # Librosa is used only for I/O; logic remains in transformers
-            audio, _ = librosa.load(path, sr=16000) 
-            batch_audio.append(audio)
+            try:
+                # Load with librosa
+                audio, _ = librosa.load(path, sr=16000)
+                
+                # FIX: Handle empty or extremely short audio
+                if len(audio) < min_samples:
+                    padding = min_samples - len(audio)
+                    audio = np.pad(audio, (0, padding), 'constant')
+                
+                batch_audio.append(audio)
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
+                # Return silent audio to keep batch alignment
+                batch_audio.append(np.zeros(min_samples))
+                
         return batch_audio
 
-    def _get_wav2vec_embeddings(self, raw_audio: List[np.ndarray]) -> torch.Tensor:
+    def _get_wav2vec_embeddings(self, raw_audio: List[np.ndarray], max_length: int) -> torch.Tensor:
         """Returns pooled embeddings (Batch, Hidden_Dim)"""
+        # Processor handles truncation here
         inputs = self.w2v_processor(
             raw_audio, 
             sampling_rate=16000, 
             return_tensors="pt", 
             padding=True,
-            truncation=True
+            truncation=True,
+            max_length=max_length
         ).to(self.device)
 
         with torch.no_grad():
             outputs = self.w2v_model(**inputs)
-            # outputs.last_hidden_state: (Batch, Seq_Len, 768)
-            # Mean pool over sequence length to get a single vector per file
+            # Mean pool
             pooled = torch.mean(outputs.last_hidden_state, dim=1)
         return pooled
 
-    def _get_whisper_embeddings(self, raw_audio: List[np.ndarray]) -> torch.Tensor:
+    def _get_whisper_embeddings(self, raw_audio: List[np.ndarray], max_length: int) -> torch.Tensor:
         """Returns pooled embeddings from Whisper Encoder (Batch, Hidden_Dim)"""
-        # Whisper requires log-mel spectrograms input
+        # Note: Whisper processor usually pads/truncates to 30s internally, 
+        # but we pass max_length explicitly to be safe for the feature extractor.
         inputs = self.whisper_processor(
             raw_audio, 
             sampling_rate=16000, 
             return_tensors="pt",
             padding=True,
-            truncation=True
+            truncation=True,
+            max_length=max_length
         ).to(self.device)
         
         input_features = inputs.input_features
 
         with torch.no_grad():
-            # passing input_features to the encoder only
             outputs = self.whisper_model.encoder(input_features)
-            # outputs.last_hidden_state: (Batch, 1500, 512 for base)
-            # Mean pool over sequence length
+            # Mean pool
             pooled = torch.mean(outputs.last_hidden_state, dim=1)
         return pooled
 
-    def extract_embeddings(self, audio_paths: List[str], batch_size: int = 4) -> torch.Tensor:
+    def extract_embeddings(self, 
+                           audio_paths: List[str], 
+                           batch_size: int = 8,
+                           max_length_seconds: int = 10) -> torch.Tensor:
         """
-        Extracts embeddings batch by batch.
-        Returns: Tensor of shape (Total_Files, Embedding_Dim)
+        Args:
+            audio_paths: List of file paths.
+            batch_size: Number of files per batch.
+            max_length_seconds: Audio longer than this will be truncated. 
+                                Default 10s = 160,000 samples.
         """
         all_embeddings = []
         total_files = len(audio_paths)
+        
+        # Calculate max samples for truncation
+        max_samples = max_length_seconds * 16000
 
-        print(f"Processing {total_files} files with batch size {batch_size}...")
+        print(f"Processing {total_files} files | Batch Size: {batch_size} | Max Length: {max_length_seconds}s")
 
-        for i in range(0, total_files, batch_size):
+        # TQDM Progress Bar
+        for i in tqdm(range(0, total_files, batch_size), desc="Extracting Embeddings"):
             batch_paths = audio_paths[i : i + batch_size]
             
-            # Load raw audio
+            # Load raw audio (with Short File Fix)
             raw_audio = self._load_audio_batch(batch_paths)
             
             batch_emb = None
 
             # MODE: WAV ONLY
             if self.mode == 'wav':
-                batch_emb = self._get_wav2vec_embeddings(raw_audio)
+                batch_emb = self._get_wav2vec_embeddings(raw_audio, max_samples)
 
             # MODE: WHISPER ONLY
             elif self.mode == 'whisper':
-                batch_emb = self._get_whisper_embeddings(raw_audio)
+                batch_emb = self._get_whisper_embeddings(raw_audio, max_samples)
 
-            # MODE: FUSION (Concatenate pooled vectors)
+            # MODE: FUSION
             elif self.mode == 'fusion':
-                w2v_emb = self._get_wav2vec_embeddings(raw_audio)
-                whisper_emb = self._get_whisper_embeddings(raw_audio)
-                # Concat along the feature dimension
+                w2v_emb = self._get_wav2vec_embeddings(raw_audio, max_samples)
+                whisper_emb = self._get_whisper_embeddings(raw_audio, max_samples)
                 batch_emb = torch.cat((w2v_emb, whisper_emb), dim=1)
             
             all_embeddings.append(batch_emb.cpu())
             
-            # Clear cache to prevent OOM on large datasets
+            # Free memory
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Concatenate all batches
         if not all_embeddings:
             return torch.tensor([])
             
         final_tensor = torch.cat(all_embeddings, dim=0)
         return final_tensor
-
-    def get_embedding_stats(self, embeddings: torch.Tensor) -> Dict:
-        """Calculates basic stats for the output tensor."""
-        emb_np = embeddings.numpy()
-        return {
-            'shape': embeddings.shape,
-            'mean': np.mean(emb_np),
-            'std': np.std(emb_np),
-            'min': np.min(emb_np),
-            'max': np.max(emb_np)
-        }
-
-# --- Usage Example ---
-def main():
-    # Example: Create a dummy wav file if you don't have one, or use existing paths
-    import soundfile as sf
-    dummy_audio_name = "test_audio.wav"
-    sr = 16000
-    # Generate 3 seconds of white noise
-    dummy_data = np.random.uniform(-1, 1, sr * 3)
-    sf.write(dummy_audio_name, dummy_data, sr)
-
-    # List of files to process
-    audio_files = [dummy_audio_name] * 5  # Simulate 5 files
-
-    # 1. Test Wav2Vec Only
-    print("\n--- Mode: Wav2Vec ---")
-    extractor_wav = AudioEmbeddingExtractor(mode='wav')
-    emb_wav = extractor_wav.extract_embeddings(audio_files, batch_size=2)
-    print(f"Output Shape: {emb_wav.shape}") # Expect (5, 768)
-
-    # 2. Test Whisper Only
-    print("\n--- Mode: Whisper ---")
-    extractor_whis = AudioEmbeddingExtractor(mode='whisper')
-    emb_whis = extractor_whis.extract_embeddings(audio_files, batch_size=2)
-    print(f"Output Shape: {emb_whis.shape}") # Expect (5, 512) (for base model)
-
-    # 3. Test Fusion
-    print("\n--- Mode: Fusion ---")
-    extractor_fuse = AudioEmbeddingExtractor(mode='fusion')
-    emb_fuse = extractor_fuse.extract_embeddings(audio_files, batch_size=2)
-    print(f"Output Shape: {emb_fuse.shape}") # Expect (5, 768 + 512 = 1280)
-
-    # Stats
-    stats = extractor_fuse.get_embedding_stats(emb_fuse)
-    print("\nFusion Stats:", stats)
-
-if __name__ == "__main__":
-    main()
-if __name__ == "__main__":
-    main()
 import torch
 import numpy as np
 from datasets import load_dataset
