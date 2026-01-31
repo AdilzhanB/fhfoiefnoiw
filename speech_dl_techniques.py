@@ -835,7 +835,7 @@ import torch
 import numpy as np
 import librosa
 from typing import Dict, List, Union, Literal
-from tqdm.auto import tqdm  # Progress bar
+from tqdm.auto import tqdm
 from transformers import (
     Wav2Vec2Model, 
     Wav2Vec2Processor, 
@@ -853,14 +853,12 @@ class AudioEmbeddingExtractor:
         self._load_models()
 
     def _load_models(self):
-        # 1. Load Wav2Vec2
         if self.mode in ['wav', 'fusion']:
             self.w2v_name = "facebook/wav2vec2-base-960h"
             self.w2v_processor = Wav2Vec2Processor.from_pretrained(self.w2v_name)
             self.w2v_model = Wav2Vec2Model.from_pretrained(self.w2v_name).to(self.device)
             self.w2v_model.eval()
 
-        # 2. Load Whisper
         if self.mode in ['whisper', 'fusion']:
             self.whisper_name = "openai/whisper-base"
             self.whisper_processor = WhisperProcessor.from_pretrained(self.whisper_name)
@@ -869,113 +867,106 @@ class AudioEmbeddingExtractor:
             self.whisper_model.eval()
 
     def _load_audio_batch(self, paths: List[str], min_samples: int = 4000) -> List[np.ndarray]:
-        """
-        Loads audio, resamples to 16k, and ensures minimum length to prevent Conv1D errors.
-        min_samples=4000 corresponds to 0.25 seconds, which is safe for Wav2Vec2.
-        """
+        """Loads audio and pads extremely short files to prevent Conv1D errors."""
         batch_audio = []
         for path in paths:
             try:
-                # Load with librosa
                 audio, _ = librosa.load(path, sr=16000)
-                
-                # FIX: Handle empty or extremely short audio
+                # Pad if shorter than 0.25s
                 if len(audio) < min_samples:
                     padding = min_samples - len(audio)
                     audio = np.pad(audio, (0, padding), 'constant')
-                
                 batch_audio.append(audio)
             except Exception as e:
                 print(f"Error loading {path}: {e}")
-                # Return silent audio to keep batch alignment
                 batch_audio.append(np.zeros(min_samples))
-                
         return batch_audio
 
-    def _get_wav2vec_embeddings(self, raw_audio: List[np.ndarray], max_length: int) -> torch.Tensor:
-        """Returns pooled embeddings (Batch, Hidden_Dim)"""
-        # Processor handles truncation here
+    def _get_wav2vec_embeddings(self, raw_audio: List[np.ndarray], max_length_samples: int) -> torch.Tensor:
+        """
+        Wav2Vec2 supports variable lengths. We use the user-defined max_length.
+        """
         inputs = self.w2v_processor(
             raw_audio, 
             sampling_rate=16000, 
             return_tensors="pt", 
-            padding=True,
-            truncation=True,
-            max_length=max_length
+            padding=True,        # Pad to longest in batch
+            truncation=True,     # Cut if longer than max_length
+            max_length=max_length_samples
         ).to(self.device)
 
         with torch.no_grad():
             outputs = self.w2v_model(**inputs)
-            # Mean pool
+            # Mean pool over the sequence length
             pooled = torch.mean(outputs.last_hidden_state, dim=1)
         return pooled
 
-    def _get_whisper_embeddings(self, raw_audio: List[np.ndarray], max_length: int) -> torch.Tensor:
-        """Returns pooled embeddings from Whisper Encoder (Batch, Hidden_Dim)"""
-        # Note: Whisper processor usually pads/truncates to 30s internally, 
-        # but we pass max_length explicitly to be safe for the feature extractor.
+    def _get_whisper_embeddings(self, raw_audio: List[np.ndarray]) -> torch.Tensor:
+        """
+        Whisper STRICTLY requires 30 seconds of input (3000 mel frames).
+        We force padding='max_length' which uses the model's config (30s).
+        """
         inputs = self.whisper_processor(
             raw_audio, 
             sampling_rate=16000, 
             return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length
+            padding="max_length", # <--- FIX: Forces 30s padding regardless of input length
+            truncation=True       # Truncate if > 30s
         ).to(self.device)
         
         input_features = inputs.input_features
 
         with torch.no_grad():
             outputs = self.whisper_model.encoder(input_features)
+            # outputs.last_hidden_state is always (Batch, 1500, 512) for base model
             # Mean pool
             pooled = torch.mean(outputs.last_hidden_state, dim=1)
         return pooled
 
     def extract_embeddings(self, 
                            audio_paths: List[str], 
-                           batch_size: int = 8,
-                           max_length_seconds: int = 10) -> torch.Tensor:
+                           batch_size: int = 16,
+                           max_length_seconds: int = 5) -> torch.Tensor:
         """
         Args:
             audio_paths: List of file paths.
-            batch_size: Number of files per batch.
-            max_length_seconds: Audio longer than this will be truncated. 
-                                Default 10s = 160,000 samples.
+            batch_size: Batch size.
+            max_length_seconds: Applied to Wav2Vec2 ONLY. Whisper is always padded to 30s.
         """
         all_embeddings = []
         total_files = len(audio_paths)
         
-        # Calculate max samples for truncation
-        max_samples = max_length_seconds * 16000
+        # Max samples for Wav2Vec2
+        w2v_max_samples = max_length_seconds * 16000
 
-        print(f"Processing {total_files} files | Batch Size: {batch_size} | Max Length: {max_length_seconds}s")
+        print(f"Processing {total_files} files | Batch Size: {batch_size}")
+        if self.mode == 'wav' or self.mode == 'fusion':
+            print(f"Wav2Vec2 max length set to {max_length_seconds}s")
+        if self.mode == 'whisper' or self.mode == 'fusion':
+            print(f"Whisper inputs will be auto-padded to 30s (Model Requirement)")
 
-        # TQDM Progress Bar
-        for i in tqdm(range(0, total_files, batch_size), desc="Extracting Embeddings"):
+        for i in tqdm(range(0, total_files, batch_size), desc="Extracting"):
             batch_paths = audio_paths[i : i + batch_size]
-            
-            # Load raw audio (with Short File Fix)
             raw_audio = self._load_audio_batch(batch_paths)
             
             batch_emb = None
 
-            # MODE: WAV ONLY
+            # --- MODE HANDLING ---
             if self.mode == 'wav':
-                batch_emb = self._get_wav2vec_embeddings(raw_audio, max_samples)
+                batch_emb = self._get_wav2vec_embeddings(raw_audio, w2v_max_samples)
 
-            # MODE: WHISPER ONLY
             elif self.mode == 'whisper':
-                batch_emb = self._get_whisper_embeddings(raw_audio, max_samples)
+                # Note: We do NOT pass max_length here. Whisper handles it.
+                batch_emb = self._get_whisper_embeddings(raw_audio)
 
-            # MODE: FUSION
             elif self.mode == 'fusion':
-                w2v_emb = self._get_wav2vec_embeddings(raw_audio, max_samples)
-                whisper_emb = self._get_whisper_embeddings(raw_audio, max_samples)
+                w2v_emb = self._get_wav2vec_embeddings(raw_audio, w2v_max_samples)
+                whisper_emb = self._get_whisper_embeddings(raw_audio)
+                # Concatenate (Batch, 768) + (Batch, 512) -> (Batch, 1280)
                 batch_emb = torch.cat((w2v_emb, whisper_emb), dim=1)
             
             all_embeddings.append(batch_emb.cpu())
             
-            # Free memory
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -984,6 +975,27 @@ class AudioEmbeddingExtractor:
             
         final_tensor = torch.cat(all_embeddings, dim=0)
         return final_tensor
+
+# --- Usage Example ---
+if __name__ == "__main__":
+    # Your paths
+    # paths = train.sampleID.values.tolist()
+    # paths = ["/kaggle/input/.../" + p + ".wav" for p in paths]
+    
+    # Dummy setup for verification
+    import soundfile as sf
+    dummy_name = "test_short.wav"
+    sf.write(dummy_name, np.random.uniform(-1, 1, 16000*5), 16000) # 5 seconds
+    paths = [dummy_name] * 4
+
+    # Run Fusion
+    extractor = AudioEmbeddingExtractor(mode='fusion')
+    
+    # Even though we say 5s, Whisper will internally pad to 30s, 
+    # Wav2Vec2 will stick to 5s. The code handles this difference.
+    embeddings = extractor.extract_embeddings(paths, batch_size=2, max_length_seconds=5)
+    
+    print(f"Final Embeddings Shape: {embeddings.shape}")
 import torch
 import numpy as np
 from datasets import load_dataset
