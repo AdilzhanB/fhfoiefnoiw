@@ -187,7 +187,192 @@ class AudioResNet(nn.Module):
         x = self.fc(x)
         
         return x
+import torch
+import torchaudio
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+import os
+from tqdm.auto import tqdm
 
+class MelSpectrogramDataset(Dataset):
+    def __init__(self, 
+                 audio_paths: list, 
+                 labels: list, 
+                 sample_rate=16000, 
+                 duration=5.0, 
+                 n_mels=64):
+        """
+        Args:
+            audio_paths: List of file paths.
+            labels: List of integer labels.
+            sample_rate: Target sample rate (16k is standard).
+            duration: Target duration in seconds (e.g., 5s).
+            n_mels: Height of the spectrogram (frequency bins).
+        """
+        self.audio_paths = audio_paths
+        self.labels = labels
+        self.sample_rate = sample_rate
+        self.target_length = int(sample_rate * duration)
+        self.n_mels = n_mels
+        
+        # Define the transform: Audio -> Mel Spectrogram
+        self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_mels=n_mels,
+            n_fft=1024,
+            hop_length=512
+        )
+        # Transform: Power -> DB (Log scale is better for CNNs)
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
+
+    def __len__(self):
+        return len(self.audio_paths)
+
+    def _pad_or_truncate(self, waveform):
+        """Ensures the waveform is exactly self.target_length samples."""
+        channels, length = waveform.shape
+        
+        if length > self.target_length:
+            # Truncate (random crop could also be used here for augmentation)
+            return waveform[:, :self.target_length]
+        elif length < self.target_length:
+            # Pad with zeros (silence)
+            pad_amount = self.target_length - length
+            # Pad last dimension: (left, right)
+            return torch.nn.functional.pad(waveform, (0, pad_amount))
+        return waveform
+
+    def __getitem__(self, idx):
+        path = self.audio_paths[idx]
+        label = self.labels[idx]
+        
+        try:
+            # 1. Load Audio
+            waveform, sr = torchaudio.load(path)
+            
+            # 2. Resample if necessary
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                waveform = resampler(waveform)
+            
+            # 3. Convert Stereo to Mono
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # 4. Pad or Truncate (Time domain)
+            waveform = self._pad_or_truncate(waveform)
+            
+            # 5. Generate Mel Spectrogram (Frequency domain)
+            # Input: (1, Time) -> Output: (1, n_mels, time_steps)
+            spec = self.mel_spectrogram(waveform)
+            spec = self.amplitude_to_db(spec)
+            
+            # 6. Optional: Normalize (Instance normalization)
+            mean = spec.mean()
+            std = spec.std()
+            spec = (spec - mean) / (std + 1e-6)
+
+            return spec, torch.tensor(label, dtype=torch.long)
+            
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            # Return a dummy tensor of correct shape to prevent crash
+            dummy_spec = torch.zeros((1, self.n_mels, int(self.target_length / 512) + 1))
+            return dummy_spec, torch.tensor(label, dtype=torch.long)
+def train_model(model, train_loader, val_loader, epochs=10, device='cuda'):
+    
+    # 1. Setup Model
+    model = model.to(device)
+    
+    # 2. "Great Loss": Label Smoothing
+    # Helps prevent overfitting by penalizing overconfidence (1.0 vs 0.0)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # 3. Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    
+    # 4. Scheduler (Cosine Decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    # 5. AMP Scaler (For Mixed Precision)
+    scaler = GradScaler()
+    
+    best_acc = 0.0
+
+    print(f"Starting training on {device}...")
+
+    for epoch in range(epochs):
+        # --- TRAINING PHASE ---
+        model.train()
+        train_loss = 0.0
+        correct = 0
+        total = 0
+        
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        
+        for inputs, labels in loop:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            # Clear gradients
+            optimizer.zero_grad()
+            
+            # Forward pass with AMP
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            # Backward pass with Scaler
+            scaler.scale(loss).backward()
+            scaler.scale(optimizer).step()
+            scaler.update()
+            
+            # Stats
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            loop.set_postfix(loss=loss.item())
+
+        train_acc = 100. * correct / total
+        
+        # --- VALIDATION PHASE ---
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+
+        val_acc = 100. * correct / total
+        
+        # Step the scheduler
+        scheduler.step()
+        
+        print(f"Epoch {epoch+1}: "
+              f"Train Loss: {train_loss/len(train_loader):.4f} | Train Acc: {train_acc:.2f}% | "
+              f"Val Loss: {val_loss/len(val_loader):.4f} | Val Acc: {val_acc:.2f}%")
+        
+        # Save Best Model
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), "best_audio_model.pth")
+            print(">>> New Best Model Saved!")
+
+    print("Training Complete.")
 # ============================================================================
 # RECURRENT MODELS FOR AUDIO
 # ============================================================================
