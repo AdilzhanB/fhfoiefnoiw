@@ -1608,3 +1608,362 @@ with torch.no_grad():
 import soundfile as sf
 sf.write("tts_result.wav", speech.cpu().numpy(), samplerate=16000)
 print("Saved output to tts_result.wav")
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import torchaudio.transforms as T
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoFeatureExtractor, AutoModel
+from peft import get_peft_model, LoraConfig, TaskType
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
+import gc
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+CONFIG = {
+    "seed": 42,
+    "model_name": "openai/whisper-small", 
+    "batch_size": 16,     
+    "lr": 1e-3,           
+    "epochs": 8,
+    "max_duration": 30,   
+    "target_sr": 16000,
+    "label_smoothing": 0.1,
+    "device": "cuda" if torch.cuda.is_available() else "cpu"
+}
+
+def seed_everything(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+seed_everything(CONFIG['seed'])
+
+# ==========================================
+# 2. DATASET & AUGMENTATION
+# ==========================================
+
+class AudioDataset(Dataset):
+    def __init__(self, df, feature_extractor, label_encoder=None, is_train=True, base_path="/kaggle/input/is-that-audio-aicc-round-1-2"):
+        self.df = df
+        self.paths = df['path'].values
+        self.feature_extractor = feature_extractor
+        self.is_train = is_train
+        self.base_path = base_path
+        
+        # Fixed logic: Load labels if encoder exists, regardless of is_train
+        if label_encoder is not None:
+            self.labels = label_encoder.transform(df['label'].values)
+        else:
+            self.labels = None
+
+        # SpecAugment (Applied on Mel Spectrogram)
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=20)
+        self.time_mask = T.TimeMasking(time_mask_param=40)
+
+    def __len__(self):
+        return len(self.df)
+
+    def load_and_pad(self, path):
+        try:
+            wav, sr = torchaudio.load(os.path.join(self.base_path, path))
+        except:
+            wav = torch.zeros(1, 16000)
+            sr = 16000
+            
+        if sr != CONFIG['target_sr']:
+            wav = torchaudio.functional.resample(wav, sr, CONFIG['target_sr'])
+        
+        if wav.shape[0] > 1:
+            wav = wav[:1, :]
+            
+        wav = wav.squeeze(0).numpy()
+        
+        target_len = CONFIG['target_sr'] * CONFIG['max_duration']
+        current_len = wav.shape[0]
+        
+        if current_len > target_len:
+            wav = wav[:target_len]
+        elif current_len < target_len:
+            pad_amt = target_len - current_len
+            wav = np.pad(wav, (0, pad_amt), 'constant')
+            
+        return wav
+
+    def __getitem__(self, idx):
+        wav = self.load_and_pad(self.paths[idx])
+        
+        inputs = self.feature_extractor(
+            wav, 
+            sampling_rate=CONFIG['target_sr'], 
+            return_tensors="pt"
+        )
+        
+        mel_spec = inputs.input_features.squeeze(0)
+        
+        if self.is_train:
+            mel_spec = self.freq_mask(mel_spec)
+            mel_spec = self.time_mask(mel_spec)
+            
+        item = {"input_features": mel_spec}
+        
+        if self.labels is not None:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+            
+        return item
+
+# ==========================================
+# 3. MODEL ARCHITECTURE
+# ==========================================
+
+class AttentionHead(nn.Module):
+    def __init__(self, hidden_dim, num_classes):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.SiLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        attn_weights = self.attention(x)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        pooled = torch.sum(x * attn_weights, dim=1)
+        logits = self.classifier(pooled)
+        return logits
+
+class WhisperClassifier(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(CONFIG['model_name']).encoder
+        self.encoder.gradient_checkpointing_enable()
+        
+        peft_config = LoraConfig(
+            r=16, 
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj", "k_proj", "out_proj"], 
+            lora_dropout=0.05,
+            bias="none"
+        )
+        self.encoder = get_peft_model(self.encoder, peft_config)
+        self.encoder.print_trainable_parameters()
+        
+        self.head = AttentionHead(self.encoder.config.d_model, num_classes)
+        
+    def forward(self, input_features):
+        outputs = self.encoder(input_features)
+        last_hidden_state = outputs.last_hidden_state 
+        logits = self.head(last_hidden_state)
+        return logits
+
+# ==========================================
+# 4. TRAINING UTILS
+# ==========================================
+
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
+    model.train()
+    running_loss = 0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(loader, desc="Train", leave=False)
+    for batch in pbar:
+        inputs = batch['input_features'].to(device)
+        labels = batch['labels'].to(device)
+        
+        optimizer.zero_grad()
+        
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        
+        running_loss += loss.item()
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        
+        pbar.set_postfix({"loss": loss.item()})
+        
+    return running_loss / len(loader), correct / total
+
+@torch.no_grad()
+def valid_one_epoch(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0
+    correct = 0
+    total = 0
+    
+    for batch in tqdm(loader, desc="Valid", leave=False):
+        inputs = batch['input_features'].to(device)
+        labels = batch['labels'].to(device)
+        
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        
+        running_loss += loss.item()
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        
+    return running_loss / len(loader), correct / total
+
+# ==========================================
+# 5. MAIN PIPELINE
+# ==========================================
+
+def run_training():
+    print("Loading Metadata...")
+    if os.path.exists("train.csv"):
+        train_df = pd.read_csv("train.csv")
+        test_df = pd.read_csv("test.csv")
+    else:
+        train_df = pd.read_csv("/kaggle/input/is-that-audio-aicc-round-1-2/train.csv")
+        test_df = pd.read_csv("/kaggle/input/is-that-audio-aicc-round-1-2/test.csv")
+    
+    # Label Encoding
+    le = LabelEncoder()
+    train_df['label_encoded'] = le.fit_transform(train_df['label'])
+    num_classes = len(le.classes_)
+    print(f"Num Classes: {num_classes}")
+    
+    # Feature Extractor
+    feature_extractor = AutoFeatureExtractor.from_pretrained(CONFIG['model_name'])
+    
+    # -------------------------------------------------------
+    # MODIFIED: No K-Fold. Single Split.
+    # -------------------------------------------------------
+    
+    # Use 80/20 Split
+    # Note: If you have classes with only 1 sample, stratify might fail. 
+    # If so, remove `stratify=train_df['label_encoded']`
+    try:
+        df_train, df_val = train_test_split(
+            train_df, 
+            test_size=0.2, 
+            random_state=CONFIG['seed'], 
+            stratify=train_df['label_encoded']
+        )
+    except ValueError:
+        print("Warning: Stratified split failed (likely classes with 1 sample). Performing random split.")
+        df_train, df_val = train_test_split(
+            train_df, 
+            test_size=0.2, 
+            random_state=CONFIG['seed']
+        )
+
+    print(f"Train Size: {len(df_train)} | Val Size: {len(df_val)}")
+
+    train_ds = AudioDataset(df_train, feature_extractor, le, is_train=True)
+    val_ds = AudioDataset(df_val, feature_extractor, le, is_train=False)
+    
+    # Loader with drop_last=True for Training
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=True, 
+        num_workers=2,
+        drop_last=True 
+    )
+    
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=False, 
+        num_workers=2
+    )
+    
+    # Initialize Model
+    model = WhisperClassifier(num_classes).to(CONFIG['device'])
+    
+    # Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-5)
+    
+    total_steps = len(train_loader) * CONFIG['epochs']
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=CONFIG['lr'], total_steps=total_steps, pct_start=0.1
+    )
+    
+    criterion = nn.CrossEntropyLoss(label_smoothing=CONFIG['label_smoothing'])
+    
+    best_acc = 0
+    best_model_state = None
+    
+    # Training Loop
+    for epoch in range(CONFIG['epochs']):
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, criterion, CONFIG['device'])
+        val_loss, val_acc = valid_one_epoch(model, val_loader, criterion, CONFIG['device'])
+        
+        print(f"Epoch {epoch+1}: Train Loss {train_loss:.4f} Acc {train_acc:.4f} | Val Loss {val_loss:.4f} Acc {val_acc:.4f}")
+        
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_model_state = model.state_dict()
+
+    # Load best model for inference
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    # Inference on Test Set
+    test_ds = AudioDataset(test_df, feature_extractor, is_train=False)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=2)
+    
+    model.eval()
+    all_preds = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Test Prediction"):
+            inputs = batch['input_features'].to(CONFIG['device'])
+            outputs = model(inputs)
+            probs = F.softmax(outputs, dim=1)
+            all_preds.append(probs.cpu().numpy())
+    
+    all_preds = np.vstack(all_preds)
+    
+    # Convert probabilities to labels
+    pred_indices = np.argmax(all_preds, axis=1)
+    pred_labels = le.inverse_transform(pred_indices)
+    
+    # ==========================================
+    # 6. SUBMISSION (Modified Column ID)
+    # ==========================================
+    print("\nGenerating Submission...")
+    
+    sub = pd.DataFrame({
+        'id': test_df['id'], # Changed from 'ID' to 'id'
+        'label': pred_labels
+    })
+    
+    sub.to_csv('submission.csv', index=False)
+    print("Saved to submission.csv")
+    
+    # Clean up
+    del model, optimizer, train_loader, val_loader
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return sub
+
+if __name__ == "__main__":
+    run_training()
