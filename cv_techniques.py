@@ -4318,3 +4318,253 @@ if __name__ == "__main__":
         print(f"Epoch {epoch+1} Loss: {loss:.4f}")
         
     inference(model, "detr_data/images/test.jpg")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ==========================================
+# 1. Building Blocks
+# ==========================================
+
+class DoubleConv(nn.Module):
+    """(Conv -> BN -> GELU -> Dropout -> Conv -> BN -> GELU)"""
+    def __init__(self, in_channels, out_channels, dropout_rate=0.3):
+        super().__init__()
+        self.s = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding='same', bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding='same', bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.s(x)
+
+class ResBlock2d(nn.Module):
+    """Residual Block wrapping a DoubleConv"""
+    def __init__(self, in_channels, out_channels, res_scale=1.0):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.res_scale = res_scale
+        self.block = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x):
+        y = self.block(x)
+        s = self.proj(x)
+        return F.relu(s + self.res_scale * y, inplace=True)
+
+class Encode(nn.Module):
+    """Downscaling with MaxPool then ResBlock"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = ResBlock2d(in_channels, out_channels)
+        self.pool = nn.MaxPool2d(2)
+        self.dropout = nn.Dropout2d(0.3)
+
+    def forward(self, x):
+        x = self.conv(x)      # Skip connection for decoder
+        p = self.pool(x)      # Downsampled output
+        p = self.dropout(p)
+        return x, p
+
+class AttentionGate(nn.Module):
+    """Attention Gate to filter features from skip connections"""
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+class Decode(nn.Module):
+    """Upscaling -> Attention -> Concatenation -> Conv"""
+    def __init__(self, in_channels, skip_channels, out_channels, pad=(0,0)):
+        super().__init__()
+        self.attn = AttentionGate(F_g=out_channels, F_l=skip_channels, F_int=skip_channels // 2)
+        # Note: output_padding is used to handle odd dimensions during upsampling
+        self.unpool = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2, output_padding=pad)
+        self.dropout = nn.Dropout2d(0.3)
+        self.conv = ResBlock2d(out_channels + skip_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.unpool(x)
+        skip = self.attn(x, skip)
+        x = torch.cat([x, skip], dim=1)
+        x = self.dropout(x)
+        x = self.conv(x)
+        return x
+
+# ==========================================
+# 2. Architectures
+# ==========================================
+
+class DualStreamUNet(nn.Module):
+    """
+    Generalization of DuoUNet.
+    Splits input channels into two equal streams (A and B), encodes them separately,
+    fuses features at every level, and decodes using fused skip connections.
+    """
+    def __init__(self, in_channels=6, num_filters=32, num_classes=5):
+        super().__init__()
+        
+        assert in_channels % 2 == 0, "in_channels must be divisible by 2 for Dual Stream splitting."
+        half_ch = in_channels // 2
+
+        # Helper: Fuse 2 inputs of size 'ch' into 1 output of size 'ch'
+        def fuse_block(ch): 
+            return nn.Conv2d(ch * 2, ch, kernel_size=1, bias=False)
+
+        # Level 1
+        self.enc_a1 = Encode(half_ch, num_filters)
+        self.enc_b1 = Encode(half_ch, num_filters)
+        self.fuse1 = fuse_block(num_filters)
+
+        # Level 2
+        self.enc_a2 = Encode(num_filters, num_filters * 2)
+        self.enc_b2 = Encode(num_filters, num_filters * 2)
+        self.fuse2 = fuse_block(num_filters * 2)
+
+        # Level 3
+        self.enc_a3 = Encode(num_filters * 2, num_filters * 4)
+        self.enc_b3 = Encode(num_filters * 2, num_filters * 4)
+        self.fuse3 = fuse_block(num_filters * 4)
+
+        # Level 4
+        self.enc_a4 = Encode(num_filters * 4, num_filters * 8)
+        self.enc_b4 = Encode(num_filters * 4, num_filters * 8)
+        self.fuse4 = fuse_block(num_filters * 8)
+
+        # Bottleneck Fusion
+        self.fuse_bottleneck = fuse_block(num_filters * 8)
+
+        # Bridge
+        self.bridge = DoubleConv(num_filters * 8, num_filters * 16)
+
+        # Decoder (Standard U-Net decoder path)
+        self.up1 = Decode(num_filters * 16, num_filters * 8, num_filters * 8, (0, 0))
+        self.up2 = Decode(num_filters * 8, num_filters * 4, num_filters * 4, (0, 1))
+        self.up3 = Decode(num_filters * 4, num_filters * 2, num_filters * 2, (1, 0))
+        self.up4 = Decode(num_filters * 2, num_filters, num_filters, (0, 1))
+
+        self.out_conv = nn.Conv2d(num_filters, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # Generic Split: First half channels vs Second half channels
+        mid = x.shape[1] // 2
+        xa_in = x[:, :mid, :, :]
+        xb_in = x[:, mid:, :, :]
+
+        # Encoders
+        skip_a1, xa = self.enc_a1(xa_in)
+        skip_b1, xb = self.enc_b1(xb_in)
+        skip1 = self.fuse1(torch.cat([skip_a1, skip_b1], dim=1)) 
+
+        skip_a2, xa = self.enc_a2(xa)
+        skip_b2, xb = self.enc_b2(xb)
+        skip2 = self.fuse2(torch.cat([skip_a2, skip_b2], dim=1))
+
+        skip_a3, xa = self.enc_a3(xa)
+        skip_b3, xb = self.enc_b3(xb)
+        skip3 = self.fuse3(torch.cat([skip_a3, skip_b3], dim=1))
+
+        skip_a4, xa = self.enc_a4(xa)
+        skip_b4, xb = self.enc_b4(xb)
+        skip4 = self.fuse4(torch.cat([skip_a4, skip_b4], dim=1))
+
+        # Bottleneck Fusion
+        x_bottleneck = self.fuse_bottleneck(torch.cat([xa, xb], dim=1))
+        
+        # Decoder
+        x = self.bridge(x_bottleneck)
+        x = self.up1(x, skip4)
+        x = self.up2(x, skip3)
+        x = self.up3(x, skip2)
+        x = self.up4(x, skip1)
+
+        return self.out_conv(x)
+
+
+class GroupedUNet(nn.Module):
+    """
+    Generalization of TriNet.
+    Uses grouped convolutions in the stem to process subsets of channels independently
+    in the early stages, then merges them in the encoder.
+    """
+    def __init__(self, in_channels=6, num_filters=32, num_classes=5, groups=3):
+        super().__init__()
+        
+        # Stem with grouped convolutions
+        mid = num_filters * groups
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 3, padding=1, groups=groups, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, num_filters, 3, padding=1, bias=False), # Merge groups here
+            nn.BatchNorm2d(num_filters),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Encoder
+        self.down1 = Encode(num_filters, num_filters * 2) 
+        self.down2 = Encode(num_filters * 2, num_filters * 4)
+        self.down3 = Encode(num_filters * 4, num_filters * 8)
+        
+        # Bridge
+        self.bridge = DoubleConv(num_filters * 8, num_filters * 16)
+        
+        # Decoder
+        self.up1 = Decode(num_filters * 16, num_filters * 8, num_filters * 8, (0, 1))
+        self.up2 = Decode(num_filters * 8, num_filters * 4, num_filters * 4, (1, 0))
+        self.up3 = Decode(num_filters * 4, num_filters * 2, num_filters, (0, 1))
+        
+        self.out_conv = nn.Conv2d(num_filters, num_classes, 1)
+
+    def forward(self, x):
+        x0 = self.stem(x)         
+        x1, x = self.down1(x0)    
+        x2, x = self.down2(x)     
+        x3, x = self.down3(x)     
+        
+        x = self.bridge(x)        
+        
+        x = self.up1(x, x3)       
+        x = self.up2(x, x2)       
+        x = self.up3(x, x1)       
+        
+        return self.out_conv(x)
+
+class SegmentationEnsemble(nn.Module):
+    """
+    General Ensemble Wrapper.
+    Combines predictions from DualStreamUNet (modality-split focus) 
+    and GroupedUNet (geometry/group focus).
+    """
+    def __init__(self, in_channels=6, num_filters=32, num_classes=5, groups=3):
+        super().__init__()
+        self.grouped_net = GroupedUNet(in_channels, num_filters, num_classes, groups)
+        self.dual_net = DualStreamUNet(in_channels, num_filters, num_classes)
+
+    def forward(self, x):
+        out_g = self.grouped_net(x)
+        out_d = self.dual_net(x)
+        return (out_g + out_d) / 2
