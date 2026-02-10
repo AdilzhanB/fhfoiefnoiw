@@ -868,3 +868,25 @@ submission = pd.DataFrame({
     'id': test['id'],
     'label': final_preds.astype(int)
 })
+def search_best_thresholds(prediction_proba, target, n_trials=100) -> np.ndarray:
+    n_classes = prediction_proba.shape[1]
+
+    def objective(trial):
+        factors = [
+            trial.suggest_float(f'factor_{i}', 1e-12, 1e12, log=True)
+            for i in range(n_classes)
+        ]
+        prediction = np.argmax(prediction_proba * factors, axis=1)
+        return recall_score(target, prediction, average='macro')
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler())
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    factors = [study.best_params[f'factor_{i}'] for i in range(n_classes)]
+    return np.array(factors)
+
+factors = search_best_thresholds_optuna(prediction_proba, data_test['target'], n_trials=100)
+prediction = np.argmax(prediction_proba * factors, axis=1)
+macro_recall = recall_score(data_test['target'], prediction, average='macro')
+print('macro_recall:', macro_recall)
+print('factors:', factors)
