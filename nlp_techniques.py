@@ -1226,3 +1226,329 @@ for _, row in tqdm(df_test.iterrows(), total=len(df_test)):
 submission_df = pd.DataFrame(results)
 submission_df.to_csv(SUBMISSION_FILE, index=False)
 print(f"\nSuccess! Predictions saved to {SUBMISSION_FILE}")
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+# Токены словаря
+PAD_IDX = 0
+SOS_IDX = 1
+EOS_IDX = 2
+UNK_IDX = 3
+
+# ==========================================
+# 1. ПРОСТОЙ DATASET
+# ==========================================
+class TranslationDataset(Dataset):
+    def __init__(self, data_pairs, src_vocab, trg_vocab):
+        """
+        data_pairs: список кортежей [("hello world", "привет мир"), ...]
+        src_vocab/trg_vocab: словари, переводящие слова в индексы
+        """
+        self.data_pairs = data_pairs
+        self.src_vocab = src_vocab
+        self.trg_vocab = trg_vocab
+
+    def __len__(self):
+        return len(self.data_pairs)
+
+    def __getitem__(self, idx):
+        src_sentence, trg_sentence = self.data_pairs[idx]
+        
+        # Токенизируем (просто по пробелам для примера) и переводим в числа
+        # Не забываем добавить <SOS> в начало и <EOS> в конец!
+        src_indices = [SOS_IDX] + [self.src_vocab.get(word, UNK_IDX) for word in src_sentence.split()] + [EOS_IDX]
+        trg_indices = [SOS_IDX] + [self.trg_vocab.get(word, UNK_IDX) for word in trg_sentence.split()] + [EOS_IDX]
+        
+        return torch.tensor(src_indices), torch.tensor(trg_indices)
+
+# ==========================================
+# 2. COLLATE_FN (Функция формирования батча)
+# ==========================================
+def collate_fn(batch):
+    """
+    Эта функция вызывается DataLoader'ом для склейки списка примеров в один тензор (батч).
+    Здесь мы делаем падинг (добавление PAD_IDX) до длины самого длинного предложения в батче.
+    """
+    src_list, trg_list = [], []
+    src_lengths = []
+    
+    for src_tensor, trg_tensor in batch:
+        src_list.append(src_tensor)
+        trg_list.append(trg_tensor)
+        # Запоминаем реальную длину (для pack_padded_sequence в энкодере)
+        src_lengths.append(len(src_tensor))
+        
+    # pad_sequence берет список тензоров разной длины и делает из них прямоугольный тензор.
+    # padding_value заполняет пустоты. batch_first=True ставит батч на первое место.
+    src_padded = pad_sequence(src_list, padding_value=PAD_IDX, batch_first=True)
+    trg_padded = pad_sequence(trg_list, padding_value=PAD_IDX, batch_first=True)
+    
+    # Для pack_padded_sequence (если enforce_sorted=True) данные должны быть отсортированы 
+    # по длине по убыванию. Но в PyTorch > 1.1 можно указать enforce_sorted=False, 
+    # тогда сортировка не обязательна, что очень упрощает код.
+    
+    return {
+        'src': src_padded,                            # [batch_size, max_src_len]
+        'src_lengths': torch.tensor(src_lengths),     # [batch_size]
+        'trg': trg_padded                             # [batch_size, max_trg_len]
+    }
+
+# ==========================================
+# 3. ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ==========================================
+# Фиктивные данные и словари
+mock_data = [
+    ("how are you", "как твои дела"),
+    ("what is your name", "как тебя зовут"),
+    ("hello", "привет")
+]
+src_v = {"how": 4, "are": 5, "you": 6, "what": 7, "is": 8, "your": 9, "name": 10, "hello": 11}
+trg_v = {"как": 4, "твои": 5, "дела": 6, "тебя": 7, "зовут": 8, "привет": 9}
+
+dataset = TranslationDataset(mock_data, src_v, trg_v)
+
+# Создаем загрузчик данных
+dataloader = DataLoader(
+    dataset, 
+    batch_size=2, 
+    shuffle=True, 
+    collate_fn=collate_fn # Передаем нашу кастомную функцию склейки
+)
+
+# Проверим, что выдает dataloader
+for batch in dataloader:
+    print("SRC SHAPE:", batch['src'].shape)                 # Ожидается [2, max_len]
+    print("SRC LENGTHS:", batch['src_lengths'])             # Ожидается [2] с реальными длинами
+    print("TRG SHAPE:", batch['trg'].shape)                 # Ожидается [2, max_len]
+    print("Данные SRC:\n", batch['src'])                    # Видим нули (PAD) в коротких предложениях
+    break
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+from typing import Tuple, List
+
+# Устанавливаем устройство для вычислений (GPU если доступно, иначе CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 1. ENCODER (Двунаправленная LSTM)
+# ==========================================
+class Encoder(nn.Module):
+    def __init__(self, input_dim: int, emb_dim: int, enc_hid_dim: int, dec_hid_dim: int, dropout: float):
+        super().__init__()
+        # Embedding слой переводит индексы слов в плотные вектора
+        # input_dim - размер словаря источника, emb_dim - размер вектора
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        
+        # Двунаправленная LSTM. Читает текст слева-направо и справа-налево.
+        # batch_first=True означает, что батч будет нулевым измерением: [batch, seq, feature]
+        self.rnn = nn.LSTM(emb_dim, enc_hid_dim, bidirectional=True, batch_first=True)
+        
+        # Линейные слои для преобразования скрытых состояний энкодера (x2 из-за двунаправленности) 
+        # в размерность, которую ожидает однонаправленный декодер
+        self.fc_hidden = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
+        self.fc_cell = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src: torch.Tensor, src_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # src: [batch_size, src_len] - индексы слов входного предложения
+        # src_lengths: [batch_size] - реальные длины предложений без учета <PAD> токенов
+        
+        # Переводим индексы в вектора
+        embedded = self.dropout(self.embedding(src)) 
+        # embedded: [batch_size, src_len, emb_dim]
+        
+        # "Упаковываем" последовательность. Это оптимизация PyTorch.
+        # LSTM не будет тратить вычисления на токены <PAD>, скрытое состояние остановится на последнем реальном слове.
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(embedded, src_lengths.cpu(), batch_first=True, enforce_sorted=False)
+        
+        # Пропускаем через LSTM
+        packed_outputs, (hidden, cell) = self.rnn(packed_embedded)
+        
+        # "Распаковываем" выходы обратно, возвращая <PAD> токены (заполняются нулями)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+        # outputs: [batch_size, src_len, enc_hid_dim * 2] (содержит состояния со всех шагов времени)
+        
+        # hidden содержит последние состояния: [num_layers * num_directions, batch_size, enc_hid_dim]
+        # Для двунаправленной LSTM (1 слой) hidden имеет размер [2, batch_size, enc_hid_dim].
+        # hidden[-2] - последнее состояние прямого прохода (forward), hidden[-1] - обратного (backward).
+        # Соединяем их вместе:
+        hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1) # [batch_size, enc_hid_dim * 2]
+        cell = torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)       # [batch_size, enc_hid_dim * 2]
+        
+        # Пропускаем через линейный слой, чтобы получить размерность декодера, и добавляем размерность слоя [1, ...]
+        hidden = torch.tanh(self.fc_hidden(hidden)).unsqueeze(0) # [1, batch_size, dec_hid_dim]
+        cell = torch.tanh(self.fc_cell(cell)).unsqueeze(0)       # [1, batch_size, dec_hid_dim]
+        
+        return outputs, hidden, cell
+
+# ==========================================
+# 2. МЕХАНИЗМ ВНИМАНИЯ (Bahdanau / Аддитивное)
+# ==========================================
+class BahdanauAttention(nn.Module):
+    def __init__(self, enc_hid_dim: int, dec_hid_dim: int):
+        super().__init__()
+        # Слой для вычисления "энергии" внимания на основе скрытого состояния декодера и выходов энкодера
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, dec_hid_dim)
+        # Вектор, превращающий вектор размерности dec_hid_dim в 1 число (оценку)
+        self.v = nn.Linear(dec_hid_dim, 1, bias=False)
+
+    def forward(self, hidden: torch.Tensor, encoder_outputs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # hidden (от декодера): [1, batch_size, dec_hid_dim]
+        # encoder_outputs: [batch_size, src_len, enc_hid_dim * 2]
+        
+        batch_size = encoder_outputs.shape[0]
+        src_len = encoder_outputs.shape[1]
+        
+        # Повторяем скрытое состояние декодера src_len раз, чтобы сравнить его с КАЖДЫМ выходом энкодера
+        # [1, batch_size, dec_hid_dim] -> [batch_size, src_len, dec_hid_dim]
+        hidden = hidden.repeat(src_len, 1, 1).transpose(0, 1)
+        
+        # Соединяем hidden и encoder_outputs, пропускаем через Linear и Tanh
+        # Сконкатенированный тензор: [batch_size, src_len, (enc_hid_dim * 2) + dec_hid_dim]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2))) 
+        # energy: [batch_size, src_len, dec_hid_dim]
+        
+        # Получаем скалярную оценку для каждого слова
+        attention = self.v(energy).squeeze(2) 
+        # attention: [batch_size, src_len]
+        
+        # НАЛОЖЕНИЕ МАСКИ: Заменяем оценки для <PAD> токенов на очень маленькое число (-1e10).
+        # После Softmax вероятность внимания на <PAD> станет ровно 0.
+        attention = attention.masked_fill(mask == 0, -1e10)
+        
+        # Возвращаем вероятности (суммируются в 1)
+        return F.softmax(attention, dim=1) # [batch_size, src_len]
+
+# ==========================================
+# 3. DECODER (Однонаправленная LSTM с Вниманием)
+# ==========================================
+class Decoder(nn.Module):
+    def __init__(self, output_dim: int, emb_dim: int, enc_hid_dim: int, dec_hid_dim: int, dropout: float, attention: nn.Module):
+        super().__init__()
+        self.output_dim = output_dim
+        self.attention = attention
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        
+        # Вход в LSTM состоит из: эмбеддинга текущего слова (emb_dim) + вектора контекста от внимания (enc_hid_dim * 2)
+        self.rnn = nn.LSTM((enc_hid_dim * 2) + emb_dim, dec_hid_dim, batch_first=True)
+        # Финальный слой предсказывает слово. На вход: выход LSTM + вектор контекста + эмбеддинг
+        self.fc_out = nn.Linear((enc_hid_dim * 2) + dec_hid_dim + emb_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor, encoder_outputs: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # input: [batch_size, 1] (одно текущее слово)
+        # hidden/cell: [1, batch_size, dec_hid_dim] (текущее скрытое состояние)
+        
+        embedded = self.dropout(self.embedding(input))
+        # embedded: [batch_size, 1, emb_dim]
+        
+        # Считаем веса внимания
+        a = self.attention(hidden, encoder_outputs, mask).unsqueeze(1) 
+        # a: [batch_size, 1, src_len]
+        
+        # Умножаем веса внимания на выходы энкодера (матричное умножение батчами - bmm)
+        # [batch_size, 1, src_len] bmm [batch_size, src_len, enc_hid_dim*2] -> [batch_size, 1, enc_hid_dim*2]
+        context = torch.bmm(a, encoder_outputs) 
+        
+        # Соединяем эмбеддинг и контекст
+        rnn_input = torch.cat((embedded, context), dim=2)
+        # rnn_input: [batch_size, 1, (enc_hid_dim * 2) + emb_dim]
+        
+        # Шаг LSTM
+        output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        # output: [batch_size, 1, dec_hid_dim]
+        
+        # Предсказываем следующее слово, используя всю имеющуюся информацию
+        prediction = self.fc_out(torch.cat((output, context, embedded), dim=2).squeeze(1)) 
+        # prediction: [batch_size, output_dim]
+        
+        return prediction, hidden, cell
+
+# ==========================================
+# 4. SEQ2SEQ (Сборка модели)
+# ==========================================
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder: Encoder, decoder: Decoder, src_pad_idx: int):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_pad_idx = src_pad_idx # Индекс токена <PAD>
+
+    def create_mask(self, src: torch.Tensor):
+        # Создает булеву маску, где False (0) стоит там, где находится <PAD> токен
+        # src: [batch_size, src_len] -> mask: [batch_size, src_len]
+        return (src != self.src_pad_idx).to(device)
+
+    def forward(self, src: torch.Tensor, src_lengths: torch.Tensor, trg: torch.Tensor, teacher_forcing_ratio: float = 0.5):
+        # trg: [batch_size, trg_len] (целевое предложение)
+        
+        batch_size = src.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.decoder.output_dim
+        
+        # Тензор для хранения всех предсказаний модели
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(device)
+        
+        # Прогоняем исходный текст через энкодер
+        encoder_outputs, hidden, cell = self.encoder(src, src_lengths)
+        mask = self.create_mask(src)
+        
+        # Первое слово на вход декодеру всегда токен <SOS> (Start of Sequence)
+        input = trg[:, 0].unsqueeze(1) # [batch_size, 1]
+        
+        # Цикл по длине целевого предложения
+        for t in range(1, trg_len):
+            output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs, mask)
+            
+            # Сохраняем предсказание для шага t
+            outputs[:, t, :] = output # [batch_size, output_dim]
+            
+            # Teacher Forcing: механизм, при котором мы с вероятностью ratio
+            # кормим модели реальное правильное следующее слово, а не то, которое она только что предсказала.
+            # Это стабилизирует обучение (особенно на ранних этапах).
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1) # Берем индекс слова с максимальной вероятностью: [batch_size]
+            
+            # Если teacher_force = True, берем слово из trg, иначе берем предсказанное (top1)
+            input = trg[:, t].unsqueeze(1) if teacher_force else top1.unsqueeze(1)
+            
+        return outputs # [batch_size, trg_len, output_dim]
+
+# ==========================================
+# 5. ШАГ ОБУЧЕНИЯ (Train Step)
+# ==========================================
+def train_step(model, iterator, optimizer, criterion, clip_val: float):
+    model.train()
+    epoch_loss = 0
+    
+    for _, batch in enumerate(iterator):
+        # Допустим наш batch возвращает словарь (подробнее в разделе Dataset ниже)
+        src = batch['src'].to(device)                 # [batch_size, src_len]
+        src_lengths = batch['src_lengths'].to(device) # [batch_size]
+        trg = batch['trg'].to(device)                 # [batch_size, trg_len]
+        
+        optimizer.zero_grad()
+        # Вызов forward
+        output = model(src, src_lengths, trg, teacher_forcing_ratio=0.5)
+        # output: [batch_size, trg_len, output_dim]
+        
+        # Для расчета Loss нужно убрать токен <SOS> (индекс 0), так как мы его не предсказываем.
+        # Также нужно "расплющить" тензоры в 2D, как этого требует nn.CrossEntropyLoss
+        output_dim = output.shape[-1]
+        output = output[:, 1:].reshape(-1, output_dim) # [(batch_size * trg_len-1), output_dim]
+        trg = trg[:, 1:].reshape(-1)                   # [(batch_size * trg_len-1)]
+        
+        loss = criterion(output, trg)
+        loss.backward()
+        
+        # Gradient Clipping (Обрезание градиентов)
+        # LSTMs склонны к "взрыву градиентов" (градиент улетает в бесконечность).
+        # Эта функция ограничивает максимальную норму градиентов значением clip_val (обычно 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
+        
+        optimizer.step()
+        epoch_loss += loss.item()
+        
+    return epoch_loss / len(iterator)
